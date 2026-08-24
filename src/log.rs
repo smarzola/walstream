@@ -6,12 +6,15 @@
 //! Losing a manifest race leaves an invisible orphan and retries against fresh
 //! state; no acknowledged record depends on local process state.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+};
 
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::records::{
-    Compression, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE, Record, RecordBatchDecoder,
-    RecordBatchEncoder, RecordEncodeOptions,
+    Compression, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE, Record, RecordBatchEncoder,
+    RecordEncodeOptions,
 };
 use object_store::{
     Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion, memory::InMemory,
@@ -21,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::codec::{MAX_BATCH_RECORDS, decode_record_batches, inspect_record_batches};
 
 const MANIFEST_SCHEMA: u32 = 1;
 const MAX_CAS_ATTEMPTS: usize = 128;
@@ -60,6 +65,17 @@ pub struct OffsetRange {
     pub latest: i64,
 }
 
+/// Bounded encoded record batches plus the partition high watermark.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedFetch {
+    /// Complete Kafka v2 record batches selected from committed segments.
+    pub records: Bytes,
+    /// Offset immediately after the final committed record.
+    pub high_watermark: i64,
+    /// Whether the first-batch exception exceeded the requested byte budget.
+    pub oversized_first_batch: bool,
+}
+
 impl LogEngine {
     /// Create an engine over any object-store implementation.
     pub fn new(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Result<Self, LogError> {
@@ -71,6 +87,88 @@ impl LogEngine {
     /// Create an engine backed by a fresh in-memory store.
     pub fn in_memory(prefix: impl Into<String>) -> Result<Self, LogError> {
         Self::new(Arc::new(InMemory::new()), prefix)
+    }
+
+    /// Ensure an empty single-partition topic exists durably.
+    ///
+    /// Concurrent creators converge through the same conditional-create
+    /// primitive used by first append.
+    pub async fn ensure_topic(&self, topic: &str, partition: i32) -> Result<(), LogError> {
+        validate_topic(topic)?;
+        validate_partition(partition)?;
+        let loaded = self.load_manifest(topic).await?;
+        let Some(loaded) = loaded else {
+            let loaded = LoadedManifest::empty();
+            return self.create_empty_topic(topic, loaded).await;
+        };
+        if loaded.version.is_some() {
+            return Ok(());
+        }
+        self.create_empty_topic(topic, loaded).await
+    }
+
+    async fn create_empty_topic(
+        &self,
+        topic: &str,
+        loaded: LoadedManifest,
+    ) -> Result<(), LogError> {
+        let bytes = Bytes::from(serde_json::to_vec(&loaded.manifest)?);
+        match self
+            .store
+            .put_opts(
+                &self.manifest_path(topic),
+                bytes.into(),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(StoreError::Precondition { .. } | StoreError::AlreadyExists { .. }) => {
+                // Validate the winner's state before treating the race as a
+                // successful creation.
+                self.load_manifest(topic)
+                    .await?
+                    .ok_or_else(|| LogError::UnknownTopic {
+                        topic: topic.to_owned(),
+                    })
+                    .map(|_| ())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// List topics that have a committed manifest in object storage.
+    pub async fn topics(&self) -> Result<Vec<String>, LogError> {
+        let prefix = format!("{}/topics", self.prefix);
+        let path = Path::from(prefix.clone());
+        let expected = format!("{prefix}/");
+        let listed = self.store.list_with_delimiter(Some(&path)).await?;
+        let mut topics = BTreeSet::new();
+
+        for common_prefix in listed.common_prefixes {
+            let object = common_prefix.to_string();
+            let Some(topic) = object.strip_prefix(&expected) else {
+                continue;
+            };
+            if topic.contains('/') {
+                continue;
+            }
+            validate_topic(topic)?;
+            if self.load_manifest(topic).await?.is_some() {
+                topics.insert(topic.to_owned());
+            }
+        }
+
+        Ok(topics.into_iter().collect())
+    }
+
+    /// Return whether a valid committed topic manifest exists.
+    pub async fn topic_exists(&self, topic: &str, partition: i32) -> Result<bool, LogError> {
+        validate_topic(topic)?;
+        validate_partition(partition)?;
+        self.load_manifest(topic)
+            .await
+            .map(|loaded| loaded.is_some())
     }
 
     /// Append a non-empty record batch to the single supported partition.
@@ -86,9 +184,18 @@ impl LogEngine {
         validate_topic(topic)?;
         validate_partition(partition)?;
         validate_records(&records)?;
+        if records.len() > MAX_BATCH_RECORDS {
+            return Err(LogError::TooManyRecords {
+                actual: records.len(),
+                maximum: MAX_BATCH_RECORDS,
+            });
+        }
 
         for _ in 0..MAX_CAS_ATTEMPTS {
-            let loaded = self.load_manifest(topic).await?;
+            let loaded = self
+                .load_manifest(topic)
+                .await?
+                .unwrap_or_else(LoadedManifest::empty);
             let base_offset = loaded.manifest.next_offset;
             let mut assigned = records.clone();
             for (delta, record) in assigned.iter_mut().enumerate() {
@@ -100,13 +207,26 @@ impl LogEngine {
                 // from the batch's -1 sentinel. Producer identity, not those
                 // derived values, determines whether idempotence is enabled.
                 record.sequence = NO_SEQUENCE.wrapping_add(delta_i32);
+                // Segment objects are one canonical batch. Incoming batch
+                // leader epochs have no meaning in this single virtual broker.
+                record.partition_leader_epoch = -1;
             }
 
+            validate_timestamp_span(&assigned)?;
             let encoded = encode_records(&assigned)?;
             if encoded.len() > MAX_BATCH_BYTES {
                 return Err(LogError::BatchTooLarge {
                     actual: encoded.len(),
                     maximum: MAX_BATCH_BYTES,
+                });
+            }
+            let inspection =
+                inspect_record_batches(&encoded).map_err(|source| LogError::Codec {
+                    detail: source.to_string(),
+                })?;
+            if inspection.batch_count != 1 || inspection.record_count != assigned.len() {
+                return Err(LogError::Codec {
+                    detail: "canonical segment did not encode as exactly one batch".into(),
                 });
             }
 
@@ -163,84 +283,176 @@ impl LogEngine {
         })
     }
 
-    /// Fetch committed records beginning at an inclusive offset.
+    /// Fetch all committed records beginning at an inclusive offset.
+    ///
+    /// Protocol-serving code should use [`Self::fetch_bounded`] so request
+    /// limits are applied before segment objects are downloaded.
     pub async fn fetch(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
     ) -> Result<Vec<Record>, LogError> {
+        let fetched = self
+            .fetch_bounded(topic, partition, offset, usize::MAX, false)
+            .await?;
+        if fetched.records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (_, decoded) =
+            decode_record_batches(fetched.records).map_err(|source| LogError::Codec {
+                detail: source.to_string(),
+            })?;
+        let records = decoded
+            .into_iter()
+            .filter(|record| record.offset >= offset)
+            .collect();
+        Ok(records)
+    }
+
+    /// Fetch complete committed segment batches within an object-read budget.
+    ///
+    /// Manifest byte lengths select segments before any segment GET. When
+    /// `allow_oversized_first_batch` is true, at most the first eligible
+    /// segment may exceed `maximum_bytes`, matching Kafka's first-batch rule.
+    pub async fn fetch_bounded(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        maximum_bytes: usize,
+        allow_oversized_first_batch: bool,
+    ) -> Result<BoundedFetch, LogError> {
         validate_topic(topic)?;
         validate_partition(partition)?;
         if offset < 0 {
             return Err(LogError::InvalidOffset { offset });
         }
 
-        let loaded = self.load_manifest(topic).await?;
-        if offset >= loaded.manifest.next_offset {
-            return Ok(Vec::new());
+        let loaded = self
+            .load_manifest(topic)
+            .await?
+            .ok_or_else(|| LogError::UnknownTopic {
+                topic: topic.to_owned(),
+            })?;
+        let high_watermark = loaded.manifest.next_offset;
+        if offset > high_watermark {
+            return Err(LogError::OffsetOutOfRange {
+                offset,
+                latest: high_watermark,
+            });
+        }
+        if offset == high_watermark {
+            return Ok(BoundedFetch {
+                records: Bytes::new(),
+                high_watermark,
+                oversized_first_batch: false,
+            });
         }
 
-        let mut records = Vec::new();
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0_usize;
+        let mut oversized_first_batch = false;
         for segment in loaded.manifest.segments {
-            let last_offset = segment.last_offset()?;
-            if last_offset < offset {
+            if segment.last_offset()? < offset {
                 continue;
             }
-
-            let path =
-                Path::parse(&segment.object).map_err(|source| LogError::InvalidManifest {
-                    detail: format!("invalid segment object path: {source}"),
-                })?;
-            let bytes = self
-                .store
-                .get(&path)
-                .await
-                .map_err(|source| LogError::MissingSegment {
-                    object: segment.object.clone(),
-                    source,
-                })?
-                .bytes()
-                .await
-                .map_err(|source| LogError::MissingSegment {
-                    object: segment.object.clone(),
-                    source,
-                })?;
-
-            if u64::try_from(bytes.len()).map_err(|_| LogError::OffsetOverflow)?
-                != segment.byte_length
-                || sha256_hex(&bytes) != segment.sha256
-            {
-                return Err(LogError::CorruptSegment {
-                    object: segment.object,
-                    detail: "length or SHA-256 mismatch".into(),
-                });
-            }
-
-            let mut input = bytes;
-            let decoded = RecordBatchDecoder::decode_all(&mut input).map_err(|source| {
-                LogError::CorruptSegment {
-                    object: segment.object.clone(),
-                    detail: source.to_string(),
+            let byte_length =
+                usize::try_from(segment.byte_length).map_err(|_| LogError::OffsetOverflow)?;
+            let fits = selected_bytes
+                .checked_add(byte_length)
+                .is_some_and(|total| total <= maximum_bytes);
+            if !fits {
+                if selected.is_empty() && allow_oversized_first_batch {
+                    oversized_first_batch = true;
+                    selected.push(segment);
                 }
-            })?;
-            let segment_records: Vec<_> = decoded.into_iter().flat_map(|set| set.records).collect();
-            validate_segment_records(&segment, &segment_records)?;
-            records.extend(
-                segment_records
-                    .into_iter()
-                    .filter(|record| record.offset >= offset),
-            );
+                break;
+            }
+            selected_bytes += byte_length;
+            selected.push(segment);
         }
 
-        Ok(records)
+        // Manifest lengths are validated and the protocol clamps selection,
+        // but avoid one eager allocation from durable metadata regardless.
+        let mut encoded = BytesMut::new();
+        for segment in selected {
+            let bytes = self.read_segment(&segment).await?;
+            encoded.extend_from_slice(&bytes);
+        }
+        Ok(BoundedFetch {
+            records: encoded.freeze(),
+            high_watermark,
+            oversized_first_batch,
+        })
+    }
+
+    async fn read_segment(&self, segment: &Segment) -> Result<Bytes, LogError> {
+        let path = Path::parse(&segment.object).map_err(|source| LogError::InvalidManifest {
+            detail: format!("invalid segment object path: {source}"),
+        })?;
+        let bytes = self
+            .store
+            .get(&path)
+            .await
+            .map_err(|source| LogError::MissingSegment {
+                object: segment.object.clone(),
+                source,
+            })?
+            .bytes()
+            .await
+            .map_err(|source| LogError::MissingSegment {
+                object: segment.object.clone(),
+                source,
+            })?;
+
+        if u64::try_from(bytes.len()).map_err(|_| LogError::OffsetOverflow)? != segment.byte_length
+            || sha256_hex(&bytes) != segment.sha256
+        {
+            return Err(LogError::CorruptSegment {
+                object: segment.object.clone(),
+                detail: "length or SHA-256 mismatch".into(),
+            });
+        }
+
+        let (inspection, segment_records) =
+            decode_record_batches(bytes.clone()).map_err(|source| LogError::CorruptSegment {
+                object: segment.object.clone(),
+                detail: source.to_string(),
+            })?;
+        if inspection.batch_count != 1 || inspection.record_count != segment.record_count as usize {
+            return Err(LogError::CorruptSegment {
+                object: segment.object.clone(),
+                detail: "invalid canonical record-batch headers".into(),
+            });
+        }
+        validate_segment_records(segment, &segment_records)?;
+        validate_canonical_segment_records(segment, &segment_records)?;
+        let canonical =
+            encode_records(&segment_records).map_err(|source| LogError::CorruptSegment {
+                object: segment.object.clone(),
+                detail: format!("cannot safely re-encode committed records: {source}"),
+            })?;
+        if canonical != bytes {
+            return Err(LogError::CorruptSegment {
+                object: segment.object.clone(),
+                detail: "record batch is not the writer's canonical encoding".into(),
+            });
+        }
+        Ok(bytes)
     }
 
     /// Return earliest inclusive and latest exclusive offsets.
     pub async fn offsets(&self, topic: &str, partition: i32) -> Result<OffsetRange, LogError> {
         validate_topic(topic)?;
         validate_partition(partition)?;
-        let manifest = self.load_manifest(topic).await?.manifest;
+        let manifest = self
+            .load_manifest(topic)
+            .await?
+            .ok_or_else(|| LogError::UnknownTopic {
+                topic: topic.to_owned(),
+            })?
+            .manifest;
         Ok(OffsetRange {
             earliest: 0,
             latest: manifest.next_offset,
@@ -258,7 +470,7 @@ impl LogEngine {
         ))
     }
 
-    async fn load_manifest(&self, topic: &str) -> Result<LoadedManifest, LogError> {
+    async fn load_manifest(&self, topic: &str) -> Result<Option<LoadedManifest>, LogError> {
         let path = self.manifest_path(topic);
         match self.store.get(&path).await {
             Ok(result) => {
@@ -272,15 +484,12 @@ impl LogEngine {
                         detail: source.to_string(),
                     })?;
                 manifest.validate(&self.prefix, topic)?;
-                Ok(LoadedManifest {
+                Ok(Some(LoadedManifest {
                     manifest,
                     version: Some(version),
-                })
+                }))
             }
-            Err(StoreError::NotFound { .. }) => Ok(LoadedManifest {
-                manifest: Manifest::default(),
-                version: None,
-            }),
+            Err(StoreError::NotFound { .. }) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -331,6 +540,13 @@ impl Manifest {
             if segment.record_count == 0 || segment.byte_length == 0 {
                 return Err(LogError::InvalidManifest {
                     detail: "segment has an empty record or byte count".into(),
+                });
+            }
+            if segment.record_count as usize > MAX_BATCH_RECORDS
+                || segment.byte_length > MAX_BATCH_BYTES as u64
+            {
+                return Err(LogError::InvalidManifest {
+                    detail: "segment exceeds the writer's record or byte bound".into(),
                 });
             }
             if !segment.object.starts_with(&expected_prefix)
@@ -386,12 +602,24 @@ struct LoadedManifest {
     version: Option<UpdateVersion>,
 }
 
+impl LoadedManifest {
+    fn empty() -> Self {
+        Self {
+            manifest: Manifest::default(),
+            version: None,
+        }
+    }
+}
+
 /// Log validation, persistence, or decoding failure.
 #[derive(Debug, Error)]
 pub enum LogError {
     /// Topic is not a safe Kafka/object-store path component.
     #[error("invalid topic name {topic:?}")]
     InvalidTopic { topic: String },
+    /// No committed manifest exists for the requested topic.
+    #[error("topic {topic:?} does not exist")]
+    UnknownTopic { topic: String },
     /// The MVP only exposes partition zero.
     #[error("partition {partition} is unsupported; the MVP supports partition 0 only")]
     UnsupportedPartition { partition: i32 },
@@ -404,12 +632,21 @@ pub enum LogError {
     /// Fetch offset was negative.
     #[error("offset {offset} must not be negative")]
     InvalidOffset { offset: i64 },
+    /// Fetch offset is beyond the partition high watermark.
+    #[error("offset {offset} is beyond latest offset {latest}")]
+    OffsetOutOfRange { offset: i64, latest: i64 },
     /// Encoded batch exceeded the bounded request size.
     #[error("encoded batch is {actual} bytes; maximum is {maximum}")]
     BatchTooLarge { actual: usize, maximum: usize },
+    /// Declared record count exceeded the bounded decoder limit.
+    #[error("batch contains {actual} records; maximum is {maximum}")]
+    TooManyRecords { actual: usize, maximum: usize },
     /// Offset arithmetic overflowed.
     #[error("offset arithmetic overflow")]
     OffsetOverflow,
+    /// Canonicalizing the batch would overflow timestamp delta arithmetic.
+    #[error("record timestamps span a range that Kafka v2 cannot encode")]
+    InvalidTimestampRange,
     /// Manifest revision overflowed.
     #[error("manifest revision overflow")]
     RevisionOverflow,
@@ -486,7 +723,18 @@ fn validate_records(records: &[Record]) -> Result<(), LogError> {
     Ok(())
 }
 
-fn encode_records(records: &[Record]) -> Result<Bytes, LogError> {
+fn validate_timestamp_span(records: &[Record]) -> Result<(), LogError> {
+    let minimum = records.iter().map(|record| record.timestamp).min();
+    let maximum = records.iter().map(|record| record.timestamp).max();
+    match (minimum, maximum) {
+        (Some(minimum), Some(maximum)) if maximum.checked_sub(minimum).is_none() => {
+            Err(LogError::InvalidTimestampRange)
+        }
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn encode_records(records: &[Record]) -> Result<Bytes, LogError> {
     let mut encoded = BytesMut::new();
     RecordBatchEncoder::encode(
         &mut encoded,
@@ -517,6 +765,32 @@ fn validate_segment_records(segment: &Segment, records: &[Record]) -> Result<(),
     Ok(())
 }
 
+fn validate_canonical_segment_records(
+    segment: &Segment,
+    records: &[Record],
+) -> Result<(), LogError> {
+    validate_records(records).map_err(|source| LogError::CorruptSegment {
+        object: segment.object.clone(),
+        detail: format!("committed records use unsupported semantics: {source}"),
+    })?;
+    validate_timestamp_span(records).map_err(|source| LogError::CorruptSegment {
+        object: segment.object.clone(),
+        detail: format!("committed timestamps are not canonical: {source}"),
+    })?;
+    if records.iter().enumerate().any(|(delta, record)| {
+        record.partition_leader_epoch != -1
+            || i32::try_from(delta)
+                .ok()
+                .is_none_or(|delta| record.sequence != NO_SEQUENCE.wrapping_add(delta))
+    }) {
+        return Err(LogError::CorruptSegment {
+            object: segment.object.clone(),
+            detail: "record leader epoch or sequence is not canonical".into(),
+        });
+    }
+    Ok(())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -534,7 +808,10 @@ mod tests {
 
     use async_trait::async_trait;
     use futures::{StreamExt, stream::BoxStream};
-    use kafka_protocol::{indexmap::IndexMap, records::TimestampType};
+    use kafka_protocol::{
+        indexmap::IndexMap,
+        records::{RecordBatchDecoder, TimestampType},
+    };
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
         PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
@@ -561,6 +838,41 @@ mod tests {
         }
     }
 
+    async fn forge_committed_segment(
+        engine: &LogEngine,
+        topic: &str,
+        mutate: impl FnOnce(&mut [u8]),
+    ) {
+        let mut manifest = engine.load_manifest(topic).await.unwrap().unwrap().manifest;
+        let segment_path = Path::from(manifest.segments[0].object.clone());
+        let mut forged = engine
+            .store
+            .get(&segment_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        mutate(&mut forged);
+        let checksum = crc32c::crc32c(&forged[21..]);
+        forged[17..21].copy_from_slice(&checksum.to_be_bytes());
+        manifest.segments[0].sha256 = sha256_hex(&forged);
+        engine
+            .store
+            .put(&segment_path, Bytes::from(forged).into())
+            .await
+            .unwrap();
+        engine
+            .store
+            .put(
+                &engine.manifest_path(topic),
+                Bytes::from(serde_json::to_vec(&manifest).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+    }
+
     #[derive(Debug)]
     struct ContentionStore {
         inner: InMemory,
@@ -583,6 +895,73 @@ mod tests {
     impl fmt::Display for ContentionStore {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("contention-test-store")
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadCountingStore {
+        inner: InMemory,
+        segment_gets: AtomicUsize,
+    }
+
+    impl ReadCountingStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                segment_gets: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl fmt::Display for ReadCountingStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("read-counting-test-store")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ReadCountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> StoreResult<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> StoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> StoreResult<GetResult> {
+            if location.to_string().ends_with(".batch") {
+                self.segment_gets.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, StoreResult<Path>>,
+        ) -> BoxStream<'static, StoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> StoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> StoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -745,6 +1124,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_fetch_selects_segments_before_object_gets() {
+        let store = Arc::new(ReadCountingStore::new());
+        let engine = LogEngine::new(store.clone(), "walstream/clusters/bounded").unwrap();
+        for value in ["one", "two", "three"] {
+            engine
+                .append("events", 0, vec![record(value)])
+                .await
+                .unwrap();
+        }
+
+        store.segment_gets.store(0, Ordering::SeqCst);
+        let fetched = engine.fetch_bounded("events", 0, 0, 1, true).await.unwrap();
+        assert!(fetched.oversized_first_batch);
+        assert_eq!(store.segment_gets.load(Ordering::SeqCst), 1);
+        let decoded = RecordBatchDecoder::decode_all(&mut fetched.records.clone()).unwrap();
+        assert_eq!(
+            decoded.into_iter().flat_map(|batch| batch.records).count(),
+            1
+        );
+
+        store.segment_gets.store(0, Ordering::SeqCst);
+        let fetched = engine
+            .fetch_bounded("events", 0, 0, 1, false)
+            .await
+            .unwrap();
+        assert!(fetched.records.is_empty());
+        assert_eq!(store.segment_gets.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reads_reject_missing_topics_and_future_offsets() {
+        let engine = LogEngine::in_memory("walstream/clusters/read-errors").unwrap();
+        assert!(matches!(
+            engine.offsets("missing", 0).await,
+            Err(LogError::UnknownTopic { .. })
+        ));
+        assert!(matches!(
+            engine.fetch_bounded("missing", 0, 0, 1024, true).await,
+            Err(LogError::UnknownTopic { .. })
+        ));
+
+        engine.ensure_topic("events", 0).await.unwrap();
+        assert!(
+            engine
+                .fetch_bounded("events", 0, 0, 1024, true)
+                .await
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert!(matches!(
+            engine.fetch_bounded("events", 0, 1, 1024, true).await,
+            Err(LogError::OffsetOutOfRange {
+                offset: 1,
+                latest: 0
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn manifest_rejects_segment_lengths_beyond_writer_bounds() {
+        let engine = LogEngine::in_memory("walstream/clusters/manifest-bounds").unwrap();
+        for (topic, record_count, byte_length) in [
+            ("too-many-records", MAX_BATCH_RECORDS as u32 + 1, 1),
+            ("too-many-bytes", 1, MAX_BATCH_BYTES as u64 + 1),
+        ] {
+            let manifest = Manifest {
+                schema: MANIFEST_SCHEMA,
+                revision: 1,
+                next_offset: i64::from(record_count),
+                segments: vec![Segment {
+                    object: engine.segment_path(topic, Uuid::new_v4()).to_string(),
+                    base_offset: 0,
+                    record_count,
+                    byte_length,
+                    sha256: "0".repeat(64),
+                }],
+            };
+            engine
+                .store
+                .put_opts(
+                    &engine.manifest_path(topic),
+                    Bytes::from(serde_json::to_vec(&manifest).unwrap()).into(),
+                    PutMode::Create.into(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                engine.offsets(topic, 0).await,
+                Err(LogError::InvalidManifest { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_records_are_raw_validated_before_decoding() {
+        let engine = LogEngine::in_memory("walstream/clusters/durable-validation").unwrap();
+        engine.append("events", 0, vec![record("a")]).await.unwrap();
+
+        forge_committed_segment(&engine, "events", |forged| {
+            forged[0..8].copy_from_slice(&i64::MAX.to_be_bytes());
+            assert_eq!(forged[64], 0, "fixture offset delta changed");
+            forged[64] = 2; // zig-zag encoding of +1, which overflows base offset
+        })
+        .await;
+
+        assert!(matches!(
+            engine.fetch("events", 0, 0).await,
+            Err(LogError::CorruptSegment { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_reads_reject_noncanonical_semantics_and_batch_headers() {
+        fn make_transactional(bytes: &mut [u8]) {
+            let attributes = i16::from_be_bytes(bytes[21..23].try_into().unwrap()) | (1 << 4);
+            bytes[21..23].copy_from_slice(&attributes.to_be_bytes());
+        }
+        fn make_last_offset_delta_inconsistent(bytes: &mut [u8]) {
+            bytes[23..27].copy_from_slice(&1_i32.to_be_bytes());
+        }
+
+        for (cluster, mutate) in [
+            ("transactional", make_transactional as fn(&mut [u8])),
+            (
+                "last-offset-delta",
+                make_last_offset_delta_inconsistent as fn(&mut [u8]),
+            ),
+        ] {
+            let engine =
+                LogEngine::in_memory(format!("walstream/clusters/durable-canonical-{cluster}"))
+                    .unwrap();
+            engine.append("events", 0, vec![record("a")]).await.unwrap();
+            forge_committed_segment(&engine, "events", mutate).await;
+            assert!(matches!(
+                engine.fetch("events", 0, 0).await,
+                Err(LogError::CorruptSegment { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn append_rejects_unencodable_timestamp_span_without_panicking() {
+        let engine = LogEngine::in_memory("walstream/clusters/timestamp-span").unwrap();
+        let mut first = record("first");
+        first.timestamp = i64::MIN;
+        let mut second = record("second");
+        second.timestamp = i64::MAX;
+        assert!(matches!(
+            engine.append("events", 0, vec![first, second]).await,
+            Err(LogError::InvalidTimestampRange)
+        ));
+    }
+
+    #[tokio::test]
     async fn accepts_decoded_normal_multi_record_batch() {
         let mut source = vec![record("a"), record("b")];
         source[1].offset = 1;
@@ -771,6 +1305,7 @@ mod tests {
     #[tokio::test]
     async fn unreferenced_segment_is_invisible() {
         let engine = LogEngine::in_memory("walstream/clusters/test").unwrap();
+        engine.ensure_topic("events", 0).await.unwrap();
         let orphan = engine.segment_path("events", Uuid::new_v4());
         engine
             .store
@@ -842,7 +1377,12 @@ mod tests {
     async fn detects_corrupt_committed_segment() {
         let engine = LogEngine::in_memory("walstream/clusters/test").unwrap();
         engine.append("events", 0, vec![record("a")]).await.unwrap();
-        let manifest = engine.load_manifest("events").await.unwrap().manifest;
+        let manifest = engine
+            .load_manifest("events")
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest;
         let path = Path::parse(&manifest.segments[0].object).unwrap();
         engine
             .store
