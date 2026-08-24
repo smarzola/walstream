@@ -138,6 +138,15 @@ async fn closes_connections_for_unsupported_apis_and_oversized_frames() {
     oversized.write_all(&65_i32.to_be_bytes()).await.unwrap();
     assert_connection_closed(&mut oversized).await;
 
+    let mut count_bomb = TcpStream::connect(address).await.unwrap();
+    let mut metadata = request(3, 4, 4);
+    metadata.extend_from_slice(&i32::MAX.to_be_bytes());
+    metadata.push(1);
+    let body_length = i32::try_from(metadata.len() - 4).unwrap();
+    metadata[0..4].copy_from_slice(&body_length.to_be_bytes());
+    count_bomb.write_all(&metadata).await.unwrap();
+    assert_connection_closed(&mut count_bomb).await;
+
     shutdown_tx.send(()).unwrap();
     server.await.unwrap().unwrap();
 }

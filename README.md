@@ -12,7 +12,7 @@ Build the binary:
 cargo build --release
 ```
 
-Provide credentials through the standard AWS environment variables or credential chain, then verify the bucket contract before serving:
+Provide credentials through AWS environment variables or a supported workload/instance credential provider, then verify the bucket contract before serving. Walstream does not read shared `~/.aws/credentials` profiles:
 
 ```bash
 export AWS_ACCESS_KEY_ID=example
@@ -35,6 +35,8 @@ export AWS_SECRET_ACCESS_KEY=example-secret
 
 The bucket must already exist. It must provide strong read-after-write behavior plus conditional object creates and ETag-matched updates. `verify-store` proves those preconditions with a unique temporary object and fails closed if the contract is absent.
 
+Explicit-topic operation and `verify-store` need GetObject, PutObject, and DeleteObject access within the configured cluster prefix. A client Metadata request that lists every topic additionally needs ListBucket access for that prefix; startup and explicit-topic requests do not.
+
 For an S3-compatible endpoint, add `--endpoint https://s3.example.internal`. Plain HTTP requires the explicit `--allow-http` development flag. See [.env.example](.env.example) for every environment variable and `walstream serve --help` for flags.
 
 Clients must use explicit topic partition `0`. Metadata or produce access auto-creates a valid topic; there is no administrative topic API.
@@ -53,7 +55,7 @@ Walstream advertises only this exercised wire surface:
 
 Unsupported APIs and adjacent versions close the connection or return an explicit Kafka error. Unsupported partitions, follower reads, invalid offsets, transactions, idempotent/control batches, compression, duplicate header keys, and malformed data are never acknowledged as successful.
 
-The default maximum request frame is 16 MiB. Fetch returns complete segment batches and applies Kafka's oversized-first-batch exception at most once per response.
+The default maximum request frame is 16 MiB. Before generated decoding, an allocation-free structural pass limits aggregate request collection items to 10,000. Fetch returns complete segment batches and applies Kafka's oversized-first-batch exception at most once per response.
 
 ## Durability model
 
@@ -102,6 +104,7 @@ It proves conditional create/update behavior, stock-client discovery and produce
 - Kafka authentication/authorization or TLS termination;
 - compressed record batches or duplicate Kafka header keys;
 - throughput comparable to Kafka: every append uploads an object and contends on one manifest CAS.
+- more than 10,000 committed segment objects per topic in the current manifest format.
 
 Run Walstream behind appropriate network and TLS controls. The MVP has no client authentication and has not been production-hardened or scale-tested.
 

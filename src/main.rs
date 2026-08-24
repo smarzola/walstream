@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use futures::StreamExt;
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -105,7 +104,6 @@ async fn main() -> Result<()> {
         }
         Command::VerifyStore(settings) => {
             let store = build_s3_store(&settings)?;
-            store.list(None).next().await.transpose()?;
             verify_store_contract(store.as_ref(), &settings.cluster_prefix()).await?;
             println!("object store supports required create and update preconditions");
         }

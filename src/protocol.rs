@@ -29,6 +29,7 @@ use thiserror::Error;
 use crate::{
     codec::{CodecError, decode_record_batches},
     log::{LogEngine, LogError},
+    wire::validate_request_frame,
 };
 
 const BROKER_ID: i32 = 1;
@@ -105,6 +106,25 @@ pub async fn handle_request(
     let raw_key = i16::from_be_bytes([frame[0], frame[1]]);
     let version = i16::from_be_bytes([frame[2], frame[3]]);
     let api_key = ApiKey::try_from(raw_key).map_err(|_| ProtocolError::UnknownApi(raw_key))?;
+    let supported = is_supported(api_key, version);
+    let unsupported_api_versions = api_key == ApiKey::ApiVersions && (0..=4).contains(&version);
+    if !supported && !unsupported_api_versions {
+        return Err(if SUPPORTED_APIS.iter().any(|entry| entry.0 == api_key) {
+            ProtocolError::UnsupportedVersion {
+                api_key: raw_key,
+                version,
+            }
+        } else {
+            ProtocolError::UnsupportedApi(raw_key)
+        });
+    }
+    validate_request_frame(&frame, api_key, version).map_err(|source| {
+        ProtocolError::MalformedRequest {
+            api_key: raw_key,
+            version,
+            detail: source.to_string(),
+        }
+    })?;
     let header = decode_request_header_from_buffer(&mut frame).map_err(|source| {
         ProtocolError::MalformedRequest {
             api_key: raw_key,
@@ -113,8 +133,8 @@ pub async fn handle_request(
         }
     })?;
 
-    if !is_supported(api_key, version) {
-        if api_key == ApiKey::ApiVersions && (0..=4).contains(&version) {
+    if !supported {
+        if unsupported_api_versions {
             let _ = kafka_protocol::messages::api_versions_request::ApiVersionsRequest::decode(
                 &mut frame, version,
             )
@@ -137,14 +157,7 @@ pub async fn handle_request(
             .map(Some);
         }
 
-        return Err(if SUPPORTED_APIS.iter().any(|entry| entry.0 == api_key) {
-            ProtocolError::UnsupportedVersion {
-                api_key: raw_key,
-                version,
-            }
-        } else {
-            ProtocolError::UnsupportedApi(raw_key)
-        });
+        unreachable!("all other unsupported APIs return before wire decoding");
     }
 
     let request = RequestKind::decode(api_key, &mut frame, version).map_err(|source| {
@@ -470,6 +483,8 @@ fn log_error_code(error: &LogError) -> i16 {
         | LogError::Codec { .. } => ResponseError::CorruptMessage.code(),
         LogError::OffsetOverflow
         | LogError::RevisionOverflow
+        | LogError::SegmentLimit { .. }
+        | LogError::ManifestTooLarge { .. }
         | LogError::Serialization(_)
         | LogError::ObjectStore(_)
         | LogError::ContentionExhausted { .. } => ResponseError::KafkaStorageError.code(),
@@ -834,6 +849,19 @@ mod tests {
 
     #[test]
     fn raw_validator_rejects_header_allocation_and_delta_overflow_hazards() {
+        let mut reserved_attributes = vec![1];
+        push_var_i64(0, &mut reserved_attributes);
+        push_var_i32(0, &mut reserved_attributes);
+        push_var_i32(-1, &mut reserved_attributes);
+        push_var_i32(-1, &mut reserved_attributes);
+        push_var_i32(0, &mut reserved_attributes);
+        assert_eq!(
+            decode_records(Some(Bytes::from(batch_with_record_body(
+                &reserved_attributes,
+            )))),
+            Err(ResponseError::CorruptMessage.code())
+        );
+
         let mut enormous_headers = vec![0]; // attributes
         push_var_i64(0, &mut enormous_headers);
         push_var_i32(0, &mut enormous_headers);

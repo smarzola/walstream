@@ -101,7 +101,10 @@ fn validate_raw_records(
             let record_length =
                 usize::try_from(record_length).map_err(|_| CodecError::Malformed)?;
             let mut record = take_raw(&mut records, record_length)?;
-            take_raw(&mut record, 1)?; // attributes
+            let attributes = take_raw(&mut record, 1)?[0];
+            if attributes != 0 {
+                return Err(CodecError::Malformed);
+            }
 
             let timestamp_delta = read_var_i64(&mut record)?;
             info.min_timestamp

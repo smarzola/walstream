@@ -12,15 +12,19 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use futures::StreamExt;
 use kafka_protocol::records::{
     Compression, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE, Record, RecordBatchEncoder,
     RecordEncodeOptions,
 };
 use object_store::{
-    Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion, memory::InMemory,
-    path::Path,
+    Error as StoreError, GetResult, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion,
+    memory::InMemory, path::Path,
 };
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{Error as DeserializeError, SeqAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -30,6 +34,8 @@ use crate::codec::{MAX_BATCH_RECORDS, decode_record_batches, inspect_record_batc
 const MANIFEST_SCHEMA: u32 = 1;
 const MAX_CAS_ATTEMPTS: usize = 128;
 const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MANIFEST_SEGMENTS: usize = 10_000;
 
 /// Durable partition log backed by an object store.
 #[derive(Clone)]
@@ -196,6 +202,11 @@ impl LogEngine {
                 .load_manifest(topic)
                 .await?
                 .unwrap_or_else(LoadedManifest::empty);
+            if loaded.manifest.segments.len() >= MAX_MANIFEST_SEGMENTS {
+                return Err(LogError::SegmentLimit {
+                    maximum: MAX_MANIFEST_SEGMENTS,
+                });
+            }
             let base_offset = loaded.manifest.next_offset;
             let mut assigned = records.clone();
             for (delta, record) in assigned.iter_mut().enumerate() {
@@ -232,10 +243,6 @@ impl LogEngine {
 
             let object = self.segment_path(topic, Uuid::new_v4());
             let checksum = sha256_hex(&encoded);
-            self.store
-                .put_opts(&object, encoded.clone().into(), PutMode::Create.into())
-                .await?;
-
             let record_count =
                 i64::try_from(assigned.len()).map_err(|_| LogError::OffsetOverflow)?;
             let next_offset = base_offset
@@ -257,6 +264,15 @@ impl LogEngine {
             });
 
             let bytes = Bytes::from(serde_json::to_vec(&next)?);
+            if bytes.len() > MAX_MANIFEST_BYTES {
+                return Err(LogError::ManifestTooLarge {
+                    actual: bytes.len(),
+                    maximum: MAX_MANIFEST_BYTES,
+                });
+            }
+            self.store
+                .put_opts(&object, encoded.clone().into(), PutMode::Create.into())
+                .await?;
             let mode = loaded.version.map_or(PutMode::Create, PutMode::Update);
             match self
                 .store
@@ -391,24 +407,35 @@ impl LogEngine {
         let path = Path::parse(&segment.object).map_err(|source| LogError::InvalidManifest {
             detail: format!("invalid segment object path: {source}"),
         })?;
-        let bytes = self
+        let result = self
             .store
             .get(&path)
             .await
             .map_err(|source| LogError::MissingSegment {
                 object: segment.object.clone(),
                 source,
-            })?
-            .bytes()
-            .await
-            .map_err(|source| LogError::MissingSegment {
+            })?;
+        if result.meta.size != segment.byte_length {
+            return Err(LogError::CorruptSegment {
                 object: segment.object.clone(),
-                source,
+                detail: "object metadata length does not match the manifest".into(),
+            });
+        }
+        let maximum = usize::try_from(segment.byte_length).map_err(|_| LogError::OffsetOverflow)?;
+        let bytes = collect_bounded(result, maximum)
+            .await
+            .map_err(|error| match error {
+                BoundedReadError::Store(source) => LogError::MissingSegment {
+                    object: segment.object.clone(),
+                    source,
+                },
+                BoundedReadError::TooLarge => LogError::CorruptSegment {
+                    object: segment.object.clone(),
+                    detail: "object body exceeds the manifest length".into(),
+                },
             })?;
 
-        if u64::try_from(bytes.len()).map_err(|_| LogError::OffsetOverflow)? != segment.byte_length
-            || sha256_hex(&bytes) != segment.sha256
-        {
+        if bytes.len() != maximum || sha256_hex(&bytes) != segment.sha256 {
             return Err(LogError::CorruptSegment {
                 object: segment.object.clone(),
                 detail: "length or SHA-256 mismatch".into(),
@@ -478,7 +505,22 @@ impl LogEngine {
                     e_tag: result.meta.e_tag.clone(),
                     version: result.meta.version.clone(),
                 };
-                let bytes = result.bytes().await?;
+                if result.meta.size > MAX_MANIFEST_BYTES as u64 {
+                    return Err(LogError::InvalidManifest {
+                        detail: format!(
+                            "manifest is {} bytes; maximum is {MAX_MANIFEST_BYTES}",
+                            result.meta.size
+                        ),
+                    });
+                }
+                let bytes = collect_bounded(result, MAX_MANIFEST_BYTES)
+                    .await
+                    .map_err(|error| match error {
+                        BoundedReadError::Store(source) => LogError::ObjectStore(source),
+                        BoundedReadError::TooLarge => LogError::InvalidManifest {
+                            detail: format!("manifest body exceeds {MAX_MANIFEST_BYTES} bytes"),
+                        },
+                    })?;
                 let manifest: Manifest =
                     serde_json::from_slice(&bytes).map_err(|source| LogError::InvalidManifest {
                         detail: source.to_string(),
@@ -495,13 +537,84 @@ impl LogEngine {
     }
 }
 
+async fn collect_bounded(
+    result: GetResult,
+    maximum_bytes: usize,
+) -> Result<Bytes, BoundedReadError> {
+    let mut stream = result.into_stream();
+    let mut output = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(BoundedReadError::Store)?;
+        if output
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > maximum_bytes)
+        {
+            return Err(BoundedReadError::TooLarge);
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output.freeze())
+}
+
+enum BoundedReadError {
+    Store(StoreError),
+    TooLarge,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     schema: u32,
     revision: u64,
     next_offset: i64,
+    #[serde(deserialize_with = "deserialize_segments")]
     segments: Vec<Segment>,
+}
+
+fn deserialize_segments<'de, D>(deserializer: D) -> Result<Vec<Segment>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedSegments;
+
+    impl<'de> Visitor<'de> for BoundedSegments {
+        type Value = Vec<Segment>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_MANIFEST_SEGMENTS} segment descriptors"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence
+                .size_hint()
+                .is_some_and(|size| size > MAX_MANIFEST_SEGMENTS)
+            {
+                return Err(A::Error::custom("manifest segment limit exceeded"));
+            }
+            let mut segments = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_MANIFEST_SEGMENTS),
+            );
+            while let Some(segment) = sequence.next_element()? {
+                if segments.len() == MAX_MANIFEST_SEGMENTS {
+                    return Err(A::Error::custom("manifest segment limit exceeded"));
+                }
+                segments.push(segment);
+            }
+            Ok(segments)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedSegments)
 }
 
 impl Default for Manifest {
@@ -641,6 +754,12 @@ pub enum LogError {
     /// Declared record count exceeded the bounded decoder limit.
     #[error("batch contains {actual} records; maximum is {maximum}")]
     TooManyRecords { actual: usize, maximum: usize },
+    /// The partition has reached the manifest's bounded segment count.
+    #[error("partition manifest reached its limit of {maximum} segments")]
+    SegmentLimit { maximum: usize },
+    /// The serialized manifest exceeded its bounded object size.
+    #[error("manifest is {actual} bytes; maximum is {maximum}")]
+    ManifestTooLarge { actual: usize, maximum: usize },
     /// Offset arithmetic overflowed.
     #[error("offset arithmetic overflow")]
     OffsetOverflow,
@@ -799,7 +918,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use std::{
         collections::HashSet,
-        fmt,
+        fmt::{self, Write},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1216,6 +1335,58 @@ mod tests {
                 Err(LogError::InvalidManifest { .. })
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn object_and_manifest_bodies_are_bounded_before_collection() {
+        let store = InMemory::new();
+        let path = Path::from("oversized-object");
+        store
+            .put(&path, Bytes::from(vec![0; 32]).into())
+            .await
+            .unwrap();
+        let result = store.get(&path).await.unwrap();
+        assert!(matches!(
+            collect_bounded(result, 16).await,
+            Err(BoundedReadError::TooLarge)
+        ));
+
+        let engine = LogEngine::in_memory("walstream/clusters/manifest-body-limit").unwrap();
+        engine
+            .store
+            .put(
+                &engine.manifest_path("events"),
+                Bytes::from(vec![b' '; MAX_MANIFEST_BYTES + 1]).into(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine.offsets("events", 0).await,
+            Err(LogError::InvalidManifest { .. })
+        ));
+    }
+
+    #[test]
+    fn manifest_deserializer_stops_at_the_segment_limit() {
+        let mut json = String::from(r#"{"schema":1,"revision":0,"next_offset":0,"segments":["#);
+        for index in 0..=MAX_MANIFEST_SEGMENTS {
+            if index != 0 {
+                json.push(',');
+            }
+            write!(
+                json,
+                r#"{{"object":"segment-{index}","base_offset":0,"record_count":1,"byte_length":1,"sha256":"{}"}}"#,
+                "0".repeat(64)
+            )
+            .unwrap();
+        }
+        json.push_str("]}");
+        let error = serde_json::from_str::<Manifest>(&json).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("manifest segment limit exceeded")
+        );
     }
 
     #[tokio::test]

@@ -24,11 +24,11 @@ Walstream does not yet collect orphan segments. They cost storage but cannot cha
 
 ## Read path and bounds
 
-The manifest is validated before it controls allocations or object reads: revisions and offsets must be contiguous, object paths must stay inside the partition, and segment counts and lengths must stay within writer limits. Fetch chooses complete segments from manifest lengths before downloading objects.
+Manifest bodies are streamed under a 4 MiB cap, and their sequence deserializer stops at 10,000 segments before allocating further entries. Revisions and offsets must be contiguous, object paths must stay inside the partition, and segment counts and lengths must stay within writer limits. Fetch chooses complete segments from manifest lengths before downloading objects.
 
-Every selected segment must match its recorded length and SHA-256. Its Kafka CRC and raw record boundaries are checked before the upstream decoder may allocate. Record/header counts and delta arithmetic are bounded, duplicate header keys are rejected, decoded offsets and unsupported semantics are checked, and safe deterministic re-encoding must reproduce the original bytes exactly.
+Every selected segment's object metadata must match its bounded manifest length, and its body is streamed only up to that length before its SHA-256 is checked. Its Kafka CRC and raw record boundaries are checked before the upstream decoder may allocate. Record/header counts, reserved attributes, and delta arithmetic are validated, duplicate header keys are rejected, decoded offsets and unsupported semantics are checked, and safe deterministic re-encoding must reproduce the original bytes exactly.
 
-Kafka request frames default to 16 MiB. Within each produced topic-partition batch, record counts are limited to 100,000, headers to 1,024 per record, and aggregate headers to 32,768. Fetch targets at most 1 MiB of record payload per response, but may exceed it for the single complete oversized-first-batch exception.
+Kafka request frames default to 16 MiB and an allocation-free structural pass limits generated-decoder collections to 10,000 aggregate items per request. Within each produced topic-partition batch, record counts are limited to 100,000, headers to 1,024 per record, and aggregate headers to 32,768. Fetch targets at most 1 MiB of record payload per response, but may exceed it for the single complete oversized-first-batch exception.
 
 ## Object-store contract
 
