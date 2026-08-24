@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use object_store::{
     Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion,
-    aws::{AmazonS3Builder, S3ConditionalPut},
+    aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut},
     path::Path,
 };
 use uuid::Uuid;
@@ -23,7 +23,11 @@ pub fn build_s3_store(settings: &S3Settings) -> Result<Arc<dyn ObjectStore>> {
         .with_allow_http(settings.allow_http);
 
     if let Some(endpoint) = &settings.endpoint {
-        builder = builder.with_endpoint(endpoint);
+        // The S3-specific slot takes precedence over both AWS_ENDPOINT_URL
+        // and AWS_ENDPOINT_URL_S3 loaded by `from_env`. An explicit Walstream
+        // CLI/environment value must never be silently redirected by ambient
+        // SDK configuration.
+        builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, endpoint);
     }
 
     Ok(Arc::new(builder.build()?))
