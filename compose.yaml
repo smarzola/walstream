@@ -1,6 +1,26 @@
 name: walstream-e2e
 
 services:
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.12
+    command:
+      - /data
+    environment:
+      RUSTFS_ACCESS_KEY: walstream
+      RUSTFS_SECRET_KEY: walstream-secret
+      RUSTFS_ADDRESS: :9000
+      RUSTFS_CONSOLE_ENABLE: "false"
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.40
+    command:
+      - mini
+      - -dir=/data
+    environment:
+      AWS_ACCESS_KEY_ID: walstream
+      AWS_SECRET_ACCESS_KEY: walstream-secret
+      S3_BUCKET: ${WALSTREAM_E2E_BUCKET}
+
   minio:
     image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
     command:
