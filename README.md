@@ -87,14 +87,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-The real-S3-compatible proof uses Apple Container, pinned MinIO images, a unique disposable bucket and prefix, and the compiled broker process:
+The real-S3-compatible proof uses Apple Container, a unique disposable bucket and prefix, and the compiled broker process. It defaults to pinned RustFS `1.0.0-beta.12`:
 
 ```bash
 container system start
 ./scripts/test-s3-e2e.sh
 ```
 
-It proves conditional create/update behavior, stock-client discovery and produce/fetch, recovery after hard process replacement, and concurrent independent writers publishing unique contiguous offsets. The script removes its test container and bucket data when it exits. It requires `container`, `container-compose`, `curl`, and `jq`; it does not use Docker.
+Run the same proof against pinned SeaweedFS `4.40` or the existing pinned MinIO target:
+
+```bash
+WALSTREAM_E2E_BACKEND=seaweedfs ./scripts/test-s3-e2e.sh
+WALSTREAM_E2E_BACKEND=minio ./scripts/test-s3-e2e.sh
+```
+
+Every backend selection proves Walstream's required conditional create/update behavior, stock-client discovery and produce/fetch, recovery after hard process replacement, and concurrent independent writers publishing unique contiguous offsets. It does not establish general S3 compatibility, backend production readiness, or comparative performance; RustFS remains a beta release. The script removes its selected test container and bucket data when it exits. It requires `container`, `container-compose`, and `jq`; it does not use Docker.
 
 ## Explicit non-goals
 
