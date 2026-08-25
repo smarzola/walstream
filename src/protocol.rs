@@ -572,9 +572,7 @@ async fn join_group_response(
                     .with_member_id(StrBytes::from_string(joined.member_id))
                     .with_metadata(joined.member_metadata),
             ]),
-        Err(error) => JoinGroupResponse::default()
-            .with_error_code(error.response_error().code())
-            .with_protocol_name(None),
+        Err(error) => JoinGroupResponse::default().with_error_code(error.response_error().code()),
     }
 }
 
@@ -1882,6 +1880,7 @@ mod tests {
             response.error_code,
             ResponseError::GroupMaxSizeReached.code()
         );
+        assert_eq!(response.protocol_name.as_ref().unwrap().as_str(), "");
 
         let (_, response) = wire_round_trip_with_groups(
             &engine,
