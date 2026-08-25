@@ -22,6 +22,14 @@ The manifest write is the only commit point. A precondition failure means anothe
 
 Walstream does not yet collect orphan segments. They cost storage but cannot change the readable log.
 
+## Consumer-group state
+
+Classic group membership is intentionally process-local. One coordinator instance is shared by every connection, and each group has one active dynamic member, generation, assignment, heartbeat deadline, and per-group operation gate. A durable commit holds that gate across its object-store update, preventing a stale generation from overwriting a replacement member's newer offset without blocking unrelated groups. Inactive slots are identity-safely reclaimed, and the broker caps resident group slots at 10,000.
+
+Only committed offsets survive replacement. Each group stores a bounded schema-v1 object at `<prefix>/clusters/<cluster-id>/groups/<group-id>/offsets.json`. OffsetCommit validates the complete request before applying it atomically, then conditionally creates or ETag-updates the object and retries from fresh state after a precondition conflict. OffsetFetch returns an explicit absence and preserves the distinction between null and empty metadata. Corrupt, future-schema, duplicate, truncated, oversized, or out-of-scope state fails closed.
+
+A broker replacement therefore preserves the next offset but deliberately loses membership. A client must rediscover the coordinator and rejoin before it can heartbeat or commit again.
+
 ## Read path and bounds
 
 Manifest bodies are streamed under a 4 MiB cap, and their sequence deserializer stops at 10,000 segments before allocating further entries. Revisions and offsets must be contiguous, object paths must stay inside the partition, and segment counts and lengths must stay within writer limits. Fetch chooses complete segments from manifest lengths before downloading objects.

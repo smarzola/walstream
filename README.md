@@ -2,7 +2,7 @@
 
 Walstream is an experimental, single-binary Kafka-compatible broker whose only durable dependency is S3-compatible object storage. Process memory and local disk are disposable: immutable Kafka record batches and a conditionally updated manifest are the log.
 
-This MVP is deliberately narrow. It provides one virtual broker, one partition per topic, explicit-partition produce/fetch, and no consumer groups. It is not a drop-in replacement for a general Kafka cluster.
+This MVP is deliberately narrow. It provides one virtual broker, one partition per topic, explicit-partition produce/fetch, and classic consumer groups with one active dynamic member per group. It is not a drop-in replacement for a general Kafka cluster.
 
 ## Run it
 
@@ -52,6 +52,13 @@ Walstream advertises only this exercised wire surface:
 | Produce | 7 | Uncompressed, non-idempotent Kafka v2 batches |
 | Fetch | 4 | Explicit offset, complete batches, 1 MiB broker payload cap |
 | ListOffsets | 3 | Earliest and latest offsets |
+| FindCoordinator | 2 | Group coordinator is this broker |
+| JoinGroup | 2 | Classic consumer protocol; one active dynamic member |
+| SyncGroup | 1 | Leader-provided opaque assignment |
+| Heartbeat | 1 | Process-local session deadline |
+| LeaveGroup | 1 | Releases ephemeral membership |
+| OffsetCommit | 2 | Atomic durable next-offset commit; default retention only |
+| OffsetFetch | 3 | Selected or all durable group offsets |
 
 Unsupported APIs and adjacent versions close the connection or return an explicit Kafka error. Unsupported partitions, follower reads, invalid offsets, transactions, idempotent/control batches, compression, duplicate header keys, and malformed data are never acknowledged as successful.
 
@@ -73,7 +80,10 @@ Objects live under:
 ```text
 <prefix>/clusters/<cluster-id>/topics/<topic>/0/manifest.json
 <prefix>/clusters/<cluster-id>/topics/<topic>/0/segments/<uuid>.batch
+<prefix>/clusters/<cluster-id>/groups/<group-id>/offsets.json
 ```
+
+Committed group offsets and optional metadata use a bounded, schema-versioned object with the same conditional-create/ETag-update discipline. They survive complete broker replacement. Membership, generations, assignments, heartbeats, and session deadlines exist only in the broker process, so a replacement requires the consumer to rejoin. Different group IDs are independent; a second live member in the same group is rejected explicitly.
 
 See [docs/architecture.md](docs/architecture.md) for the failure model and invariants.
 
@@ -85,6 +95,13 @@ Hermetic checks:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
+```
+
+The consumer-group proof is credential-free and uses Apple Container rather than Docker. It runs pinned confluent-kafka/librdkafka `2.12.1` and Apache Kafka Java client `4.2.0` against a local broker and pinned RustFS store. Each client subscribes, consumes, commits synchronously, then reconnects after the broker process is replaced and must resume at the next record without replay. The harness also pins Python `3.13.5-slim` and Maven `3.9.11` with Eclipse Temurin 21, creates unique container names and bucket/prefix state, and removes its exact processes, containers, and temporary data on exit.
+
+```bash
+container system start
+./scripts/test-consumer-group-clients.sh
 ```
 
 The real-S3-compatible proof uses Apple Container, a unique disposable bucket and prefix, and the compiled broker process. It defaults to pinned RustFS `1.0.0-beta.12`:
@@ -105,7 +122,7 @@ Every backend selection proves Walstream's required conditional create/update be
 
 ## Explicit non-goals
 
-- consumer groups, offset commits, rebalancing, transactions, and idempotent producers;
+- multi-member rebalancing, static membership, the newer consumer group protocol, offset retention, transactions, and idempotent producers;
 - more than one broker or partition, replication-factor semantics, or follower reads;
 - retention, compaction, orphan collection, quotas, or multi-region operation;
 - Kafka authentication/authorization or TLS termination;
