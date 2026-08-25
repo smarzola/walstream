@@ -57,18 +57,19 @@ wait_for_phase() {
     pid=$2
     log=$3
     name=$4
+    phase=$5
     attempt=0
     until [ -f "$marker" ]; do
         attempt=$((attempt + 1))
         if ! kill -0 "$pid" >/dev/null 2>&1; then
             wait "$pid" 2>/dev/null || true
             cat "$log" >&2
-            echo "$name exited before committing its first offset" >&2
+            echo "$name exited before $phase" >&2
             exit 1
         fi
         if [ "$attempt" -ge 240 ]; then
             cat "$log" >&2
-            echo "$name did not commit its first offset" >&2
+            echo "$name did not $phase" >&2
             exit 1
         fi
         sleep 0.25
@@ -200,13 +201,35 @@ container exec "$java_name" mvn -q -f /work/pom.xml exec:java \
 java_pid=$!
 
 wait_for_phase "$tmp_dir/librdkafka.ready" "$librdkafka_pid" \
-    "$tmp_dir/librdkafka.log" librdkafka
-wait_for_phase "$tmp_dir/java.ready" "$java_pid" "$tmp_dir/java.log" java
+    "$tmp_dir/librdkafka.log" librdkafka "commit its first offset"
+wait_for_phase "$tmp_dir/java.ready" "$java_pid" "$tmp_dir/java.log" \
+    java "commit its first offset"
 
 stop_broker
 sleep 2
+for marker in "$tmp_dir/librdkafka.rejoined" "$tmp_dir/java.rejoined"; do
+    if [ -e "$marker" ]; then
+        echo "client reported replacement rejoin before the original broker stopped" >&2
+        exit 1
+    fi
+done
+touch "$tmp_dir/arm"
+wait_for_phase "$tmp_dir/librdkafka.armed" "$librdkafka_pid" \
+    "$tmp_dir/librdkafka.log" librdkafka "arm its broker-epoch boundary"
+wait_for_phase "$tmp_dir/java.armed" "$java_pid" "$tmp_dir/java.log" \
+    java "arm its broker-epoch boundary"
+for marker in "$tmp_dir/librdkafka.rejoined" "$tmp_dir/java.rejoined"; do
+    if [ -e "$marker" ]; then
+        echo "client reported replacement rejoin while the broker was down" >&2
+        exit 1
+    fi
+done
 start_broker
-touch "$tmp_dir/proceed"
+
+wait_for_phase "$tmp_dir/librdkafka.rejoined" "$librdkafka_pid" \
+    "$tmp_dir/librdkafka.log" librdkafka "rejoin the replacement broker"
+wait_for_phase "$tmp_dir/java.rejoined" "$java_pid" "$tmp_dir/java.log" \
+    java "rejoin the replacement broker"
 
 if ! wait "$librdkafka_pid"; then
     cat "$tmp_dir/librdkafka.log" >&2

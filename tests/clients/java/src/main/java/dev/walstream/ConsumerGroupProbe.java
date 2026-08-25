@@ -1,16 +1,20 @@
 package dev.walstream;
 
-import java.time.Duration;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.RangeAssignor;
@@ -36,22 +40,37 @@ public final class ConsumerGroupProbe {
         String secondValue = args[4];
         Path stateDirectory = Path.of(args[5]);
         Path ready = stateDirectory.resolve("java.ready");
-        Path proceed = stateDirectory.resolve("proceed");
+        Path arm = stateDirectory.resolve("arm");
+        Path armed = stateDirectory.resolve("java.armed");
+        Path rejoined = stateDirectory.resolve("java.rejoined");
 
         produce(bootstrap, topic, firstValue);
         TopicPartition partition = new TopicPartition(topic, 0);
         try {
             try (KafkaConsumer<String, String> consumer = consumer(bootstrap, group)) {
-                consumer.subscribe(List.of(topic));
+                AtomicInteger assignmentCount = new AtomicInteger();
+                AtomicReference<Set<TopicPartition>> lastAssignment =
+                        new AtomicReference<>(Set.of());
+                consumer.subscribe(List.of(topic), new ConsumerRebalanceListener() {
+                    @Override
+                    public void onPartitionsRevoked(Collection<TopicPartition> partitions) {}
+
+                    @Override
+                    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+                        lastAssignment.set(Set.copyOf(partitions));
+                        assignmentCount.incrementAndGet();
+                    }
+                });
                 ConsumerRecord<String, String> first =
                         consumeExact(consumer, topic, firstValue, 0);
                 commitExact(consumer, partition, 0);
                 Files.writeString(ready, "committed offset 1\n");
 
                 long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
-                while (!Files.exists(proceed)) {
+                while (!Files.exists(arm)) {
                     if (System.nanoTime() >= deadline) {
-                        throw new IllegalStateException("timed out waiting for broker replacement");
+                        throw new IllegalStateException(
+                                "timed out waiting to arm replacement recovery");
                     }
                     ConsumerRecords<String, String> records =
                             consumer.poll(Duration.ofMillis(250));
@@ -63,6 +82,46 @@ public final class ConsumerGroupProbe {
                     }
                 }
 
+                String originalMemberId = consumer.groupMetadata().memberId();
+                if (originalMemberId == null || originalMemberId.isEmpty()) {
+                    throw new IllegalStateException(
+                            "active consumer had no member ID before replacement");
+                }
+                int armedAssignmentCount = assignmentCount.get();
+                Files.writeString(
+                        armed,
+                        "assignment_count=" + armedAssignmentCount
+                                + " member_id=" + originalMemberId + "\n");
+
+                Set<TopicPartition> expectedAssignment = Set.of(partition);
+                deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+                String replacementMemberId;
+                while (true) {
+                    if (System.nanoTime() >= deadline) {
+                        throw new IllegalStateException(
+                                "timed out waiting to rejoin the replacement broker");
+                    }
+                    ConsumerRecords<String, String> records =
+                            consumer.poll(Duration.ofMillis(250));
+                    if (!records.isEmpty()) {
+                        ConsumerRecord<String, String> unexpected = records.iterator().next();
+                        throw new IllegalStateException(
+                                "received unexpected record before replacement rejoin: offset "
+                                        + unexpected.offset());
+                    }
+                    replacementMemberId = consumer.groupMetadata().memberId();
+                    if (assignmentCount.get() > armedAssignmentCount
+                            && lastAssignment.get().equals(expectedAssignment)
+                            && replacementMemberId != null
+                            && !replacementMemberId.isEmpty()
+                            && !replacementMemberId.equals(originalMemberId)) {
+                        break;
+                    }
+                }
+
+                Files.writeString(
+                        rejoined,
+                        "member_id=" + replacementMemberId + " assignment=" + topic + "[0]\n");
                 produce(bootstrap, topic, secondValue);
                 ConsumerRecord<String, String> second =
                         consumeExact(consumer, topic, secondValue, 1);
@@ -70,6 +129,7 @@ public final class ConsumerGroupProbe {
             }
         } finally {
             Files.deleteIfExists(ready);
+            Files.deleteIfExists(armed);
         }
 
         System.out.printf(

@@ -67,7 +67,9 @@ def main() -> None:
     bootstrap, topic, group, first_value, second_value, raw_state_dir = sys.argv[1:]
     state_dir = Path(raw_state_dir)
     ready = state_dir / "librdkafka.ready"
-    proceed = state_dir / "proceed"
+    arm = state_dir / "arm"
+    armed = state_dir / "librdkafka.armed"
+    rejoined = state_dir / "librdkafka.rejoined"
 
     produce(bootstrap, topic, first_value)
     consumer = Consumer(
@@ -82,15 +84,24 @@ def main() -> None:
         }
     )
     try:
-        consumer.subscribe([topic])
+        assignment_count = [0]
+        last_assignment = [set()]
+
+        def on_assign(_consumer, partitions) -> None:
+            assignment_count[0] += 1
+            last_assignment[0] = {
+                (partition.topic, partition.partition) for partition in partitions
+            }
+
+        consumer.subscribe([topic], on_assign=on_assign)
         first = consume_exact(consumer, topic, first_value, 0)
         commit_exact(consumer, first, topic, 0)
         ready.write_text("committed offset 1\n", encoding="utf-8")
 
         deadline = time.monotonic() + 60
-        while not proceed.exists():
+        while not arm.exists():
             if time.monotonic() >= deadline:
-                fail("timed out waiting for broker replacement")
+                fail("timed out waiting to arm replacement recovery")
             message = consumer.poll(0.25)
             if message is not None and message.error() is None:
                 fail(
@@ -98,12 +109,46 @@ def main() -> None:
                     f"offset {message.offset()}"
                 )
 
+        original_member_id = consumer.memberid()
+        if not original_member_id:
+            fail("active consumer had no member ID before replacement")
+        armed_assignment_count = assignment_count[0]
+        armed.write_text(
+            f"assignment_count={armed_assignment_count} member_id={original_member_id}\n",
+            encoding="utf-8",
+        )
+
+        expected_assignment = {(topic, 0)}
+        deadline = time.monotonic() + 60
+        while True:
+            if time.monotonic() >= deadline:
+                fail("timed out waiting to rejoin the replacement broker")
+            message = consumer.poll(0.25)
+            if message is not None and message.error() is None:
+                fail(
+                    f"received unexpected record before replacement rejoin: "
+                    f"offset {message.offset()}"
+                )
+            replacement_member_id = consumer.memberid()
+            if (
+                assignment_count[0] > armed_assignment_count
+                and last_assignment[0] == expected_assignment
+                and replacement_member_id
+                and replacement_member_id != original_member_id
+            ):
+                break
+
+        rejoined.write_text(
+            f"member_id={replacement_member_id} assignment={topic}[0]\n",
+            encoding="utf-8",
+        )
         produce(bootstrap, topic, second_value)
         second = consume_exact(consumer, topic, second_value, 1)
         commit_exact(consumer, second, topic, 1)
     finally:
         consumer.close()
         ready.unlink(missing_ok=True)
+        armed.unlink(missing_ok=True)
 
     print(
         f"librdkafka {libversion()[0]} kept one consumer alive across replacement, "
