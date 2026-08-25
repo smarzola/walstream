@@ -4,6 +4,7 @@
 
 mod codec;
 pub mod config;
+pub mod group;
 pub mod log;
 pub mod protocol;
 pub mod server;
