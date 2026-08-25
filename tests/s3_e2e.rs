@@ -107,7 +107,7 @@ fn record(value: &str, timestamp: i64) -> Record {
 }
 
 #[tokio::test]
-#[ignore = "requires scripts/test-s3-e2e.sh and its Apple Container MinIO service"]
+#[ignore = "requires scripts/test-s3-e2e.sh and an Apple Container S3-compatible service"]
 async fn binary_recovers_from_s3_and_serializes_independent_writers() {
     let bucket = std::env::var("WALSTREAM_E2E_BUCKET").expect("test bucket");
     let endpoint = std::env::var("WALSTREAM_E2E_ENDPOINT").expect("test endpoint");
