@@ -86,6 +86,17 @@ impl GroupStore {
         Ok(Self { store, prefix })
     }
 
+    /// Validate a Kafka group ID without performing object-store I/O.
+    pub fn validate_group_id(group: &str) -> Result<(), GroupError> {
+        validate_component(group, IdentifierKind::Group)
+    }
+
+    /// Validate one topic-partition without performing object-store I/O.
+    pub fn validate_topic_partition(key: &TopicPartition) -> Result<(), GroupError> {
+        validate_component(&key.topic, IdentifierKind::Topic)?;
+        validate_partition(key.partition)
+    }
+
     /// Atomically apply every valid entry in one OffsetCommit request.
     pub async fn commit(&self, group: &str, commits: &[OffsetCommit]) -> Result<(), GroupError> {
         validate_component(group, IdentifierKind::Group)?;

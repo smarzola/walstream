@@ -11,6 +11,8 @@ use rskafka::{
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use walstream::{
+    coordinator::GroupCoordinator,
+    group::GroupStore,
     log::LogEngine,
     protocol::BrokerIdentity,
     server::{DEFAULT_MAX_FRAME_BYTES, serve},
@@ -32,11 +34,14 @@ impl RunningServer {
 async fn start(store: Arc<dyn ObjectStore>, address: &str) -> RunningServer {
     let listener = TcpListener::bind(address).await.unwrap();
     let address = listener.local_addr().unwrap();
-    let engine = LogEngine::new(store, "walstream/clusters/stock").unwrap();
+    let engine = LogEngine::new(store.clone(), "walstream/clusters/stock").unwrap();
+    let groups =
+        GroupCoordinator::new(GroupStore::new(store.clone(), "walstream/clusters/stock").unwrap());
     let (shutdown, receiver) = oneshot::channel();
     let task = tokio::spawn(serve(
         listener,
         engine,
+        groups,
         BrokerIdentity {
             host: "127.0.0.1".into(),
             port: address.port(),

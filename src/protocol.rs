@@ -10,6 +10,14 @@ use kafka_protocol::{
         api_versions_response::{ApiVersion, ApiVersionsResponse},
         fetch_request::FetchRequest,
         fetch_response::{FetchResponse, FetchableTopicResponse, PartitionData},
+        find_coordinator_request::FindCoordinatorRequest,
+        find_coordinator_response::FindCoordinatorResponse,
+        heartbeat_request::HeartbeatRequest,
+        heartbeat_response::HeartbeatResponse,
+        join_group_request::JoinGroupRequest,
+        join_group_response::{JoinGroupResponse, JoinGroupResponseMember},
+        leave_group_request::LeaveGroupRequest,
+        leave_group_response::LeaveGroupResponse,
         list_offsets_request::ListOffsetsRequest,
         list_offsets_response::{
             ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
@@ -19,8 +27,18 @@ use kafka_protocol::{
             MetadataResponse, MetadataResponseBroker, MetadataResponsePartition,
             MetadataResponseTopic,
         },
+        offset_commit_request::OffsetCommitRequest,
+        offset_commit_response::{
+            OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+        },
+        offset_fetch_request::OffsetFetchRequest,
+        offset_fetch_response::{
+            OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+        },
         produce_request::ProduceRequest,
         produce_response::{PartitionProduceResponse, ProduceResponse, TopicProduceResponse},
+        sync_group_request::SyncGroupRequest,
+        sync_group_response::SyncGroupResponse,
     },
     protocol::{Decodable, Encodable, StrBytes, decode_request_header_from_buffer},
 };
@@ -28,6 +46,8 @@ use thiserror::Error;
 
 use crate::{
     codec::{CodecError, decode_record_batches},
+    coordinator::{GroupCoordinator, JoinProtocol, SyncAssignment},
+    group::{CommittedOffset, OffsetCommit, TopicPartition},
     log::{LogEngine, LogError},
     wire::validate_request_frame,
 };
@@ -44,6 +64,13 @@ pub const SUPPORTED_APIS: &[(ApiKey, i16, i16)] = &[
     (ApiKey::Fetch, 4, 4),
     (ApiKey::ListOffsets, 3, 3),
     (ApiKey::Metadata, 4, 4),
+    (ApiKey::OffsetCommit, 2, 2),
+    (ApiKey::OffsetFetch, 3, 3),
+    (ApiKey::FindCoordinator, 2, 2),
+    (ApiKey::JoinGroup, 2, 2),
+    (ApiKey::Heartbeat, 1, 1),
+    (ApiKey::LeaveGroup, 1, 1),
+    (ApiKey::SyncGroup, 1, 1),
     (ApiKey::ApiVersions, 0, 3),
 ];
 
@@ -94,6 +121,7 @@ fn valid_advertised_host(host: &str) -> bool {
 pub async fn handle_request(
     mut frame: Bytes,
     engine: &LogEngine,
+    groups: &GroupCoordinator,
     identity: &BrokerIdentity,
 ) -> Result<Option<Bytes>, ProtocolError> {
     identity.validate()?;
@@ -190,6 +218,34 @@ pub async fn handle_request(
         ),
         RequestKind::ListOffsets(request) => (
             ResponseKind::ListOffsets(list_offsets_response(request, engine).await),
+            true,
+        ),
+        RequestKind::FindCoordinator(request) => (
+            ResponseKind::FindCoordinator(find_coordinator_response(request, groups, identity)),
+            true,
+        ),
+        RequestKind::JoinGroup(request) => (
+            ResponseKind::JoinGroup(join_group_response(request, groups).await),
+            true,
+        ),
+        RequestKind::SyncGroup(request) => (
+            ResponseKind::SyncGroup(sync_group_response(request, groups).await),
+            true,
+        ),
+        RequestKind::Heartbeat(request) => (
+            ResponseKind::Heartbeat(heartbeat_response(request, groups).await),
+            true,
+        ),
+        RequestKind::LeaveGroup(request) => (
+            ResponseKind::LeaveGroup(leave_group_response(request, groups).await),
+            true,
+        ),
+        RequestKind::OffsetCommit(request) => (
+            ResponseKind::OffsetCommit(offset_commit_response(request, groups).await),
+            true,
+        ),
+        RequestKind::OffsetFetch(request) => (
+            ResponseKind::OffsetFetch(offset_fetch_response(request, groups).await),
             true,
         ),
         _ => return Err(ProtocolError::UnsupportedApi(raw_key)),
@@ -463,6 +519,309 @@ async fn list_offsets_response(
     ListOffsetsResponse::default().with_topics(topics)
 }
 
+fn find_coordinator_response(
+    request: FindCoordinatorRequest,
+    groups: &GroupCoordinator,
+    identity: &BrokerIdentity,
+) -> FindCoordinatorResponse {
+    let error = if request.key_type != 0 {
+        Some(ResponseError::InvalidRequest)
+    } else {
+        groups
+            .validate_group_id(request.key.as_str())
+            .err()
+            .map(|error| error.response_error())
+    };
+    FindCoordinatorResponse::default()
+        .with_error_code(error.map_or(0, |error| error.code()))
+        .with_error_message(None)
+        .with_node_id(BrokerId(BROKER_ID))
+        .with_host(StrBytes::from_string(identity.host.clone()))
+        .with_port(i32::from(identity.port))
+}
+
+async fn join_group_response(
+    request: JoinGroupRequest,
+    groups: &GroupCoordinator,
+) -> JoinGroupResponse {
+    let protocols = request
+        .protocols
+        .into_iter()
+        .map(|protocol| JoinProtocol {
+            name: protocol.name.as_str().to_owned(),
+            metadata: protocol.metadata,
+        })
+        .collect::<Vec<_>>();
+    match groups
+        .join(
+            request.group_id.0.as_str(),
+            request.session_timeout_ms,
+            request.member_id.as_str(),
+            request.protocol_type.as_str(),
+            &protocols,
+        )
+        .await
+    {
+        Ok(joined) => JoinGroupResponse::default()
+            .with_generation_id(joined.generation_id)
+            .with_protocol_name(Some(StrBytes::from_string(joined.protocol_name)))
+            .with_leader(StrBytes::from_string(joined.leader_id.clone()))
+            .with_member_id(StrBytes::from_string(joined.member_id.clone()))
+            .with_members(vec![
+                JoinGroupResponseMember::default()
+                    .with_member_id(StrBytes::from_string(joined.member_id))
+                    .with_metadata(joined.member_metadata),
+            ]),
+        Err(error) => JoinGroupResponse::default()
+            .with_error_code(error.response_error().code())
+            .with_protocol_name(None),
+    }
+}
+
+async fn sync_group_response(
+    request: SyncGroupRequest,
+    groups: &GroupCoordinator,
+) -> SyncGroupResponse {
+    let assignments = request
+        .assignments
+        .into_iter()
+        .map(|assignment| SyncAssignment {
+            member_id: assignment.member_id.as_str().to_owned(),
+            assignment: assignment.assignment,
+        })
+        .collect::<Vec<_>>();
+    match groups
+        .sync(
+            request.group_id.0.as_str(),
+            request.generation_id,
+            request.member_id.as_str(),
+            &assignments,
+        )
+        .await
+    {
+        Ok(assignment) => SyncGroupResponse::default().with_assignment(assignment),
+        Err(error) => SyncGroupResponse::default().with_error_code(error.response_error().code()),
+    }
+}
+
+async fn heartbeat_response(
+    request: HeartbeatRequest,
+    groups: &GroupCoordinator,
+) -> HeartbeatResponse {
+    let error_code = groups
+        .heartbeat(
+            request.group_id.0.as_str(),
+            request.generation_id,
+            request.member_id.as_str(),
+        )
+        .await
+        .err()
+        .map_or(0, |error| error.response_error().code());
+    HeartbeatResponse::default().with_error_code(error_code)
+}
+
+async fn leave_group_response(
+    request: LeaveGroupRequest,
+    groups: &GroupCoordinator,
+) -> LeaveGroupResponse {
+    let error_code = groups
+        .leave(request.group_id.0.as_str(), request.member_id.as_str())
+        .await
+        .err()
+        .map_or(0, |error| error.response_error().code());
+    LeaveGroupResponse::default().with_error_code(error_code)
+}
+
+async fn offset_commit_response(
+    request: OffsetCommitRequest,
+    groups: &GroupCoordinator,
+) -> OffsetCommitResponse {
+    let commits = request
+        .topics
+        .iter()
+        .flat_map(|topic| {
+            topic.partitions.iter().map(|partition| OffsetCommit {
+                topic: topic.name.0.as_str().to_owned(),
+                partition: partition.partition_index,
+                offset: partition.committed_offset,
+                metadata: partition
+                    .committed_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.as_str().to_owned()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let error_code = if request.retention_time_ms != -1 {
+        ResponseError::InvalidRequest.code()
+    } else {
+        groups
+            .commit(
+                request.group_id.0.as_str(),
+                request.generation_id_or_member_epoch,
+                request.member_id.as_str(),
+                &commits,
+            )
+            .await
+            .err()
+            .map_or(0, |error| error.response_error().code())
+    };
+    OffsetCommitResponse::default().with_topics(
+        request
+            .topics
+            .into_iter()
+            .map(|topic| {
+                OffsetCommitResponseTopic::default()
+                    .with_name(topic.name)
+                    .with_partitions(
+                        topic
+                            .partitions
+                            .into_iter()
+                            .map(|partition| {
+                                OffsetCommitResponsePartition::default()
+                                    .with_partition_index(partition.partition_index)
+                                    .with_error_code(error_code)
+                            })
+                            .collect(),
+                    )
+            })
+            .collect(),
+    )
+}
+
+async fn offset_fetch_response(
+    request: OffsetFetchRequest,
+    groups: &GroupCoordinator,
+) -> OffsetFetchResponse {
+    let group = request.group_id.0.as_str().to_owned();
+    let requested_topics = request.topics;
+    if let Err(error) = groups.validate_group_id(&group) {
+        return offset_fetch_global_error(requested_topics, error.response_error());
+    }
+
+    match requested_topics {
+        None => match groups.fetch(&group, None).await {
+            Ok(fetched) => {
+                let mut by_topic = std::collections::BTreeMap::<String, Vec<_>>::new();
+                for offset in fetched {
+                    let committed = offset
+                        .committed
+                        .as_ref()
+                        .expect("all-offset fetches only return committed entries");
+                    by_topic
+                        .entry(offset.topic_partition.topic)
+                        .or_default()
+                        .push(offset_fetch_partition(
+                            offset.topic_partition.partition,
+                            Some(committed),
+                            0,
+                        ));
+                }
+                OffsetFetchResponse::default().with_topics(
+                    by_topic
+                        .into_iter()
+                        .map(|(topic, partitions)| {
+                            OffsetFetchResponseTopic::default()
+                                .with_name(topic_name(topic))
+                                .with_partitions(partitions)
+                        })
+                        .collect(),
+                )
+            }
+            Err(error) => offset_fetch_global_error(None, error.response_error()),
+        },
+        Some(topics) => {
+            let mut selection = std::collections::BTreeSet::new();
+            let mut local_errors = std::collections::BTreeMap::new();
+            for topic in &topics {
+                for partition in &topic.partition_indexes {
+                    let key = TopicPartition::new(topic.name.0.as_str(), *partition);
+                    match groups.validate_topic_partition(&key) {
+                        Ok(()) => {
+                            selection.insert(key);
+                        }
+                        Err(error) => {
+                            local_errors.insert(key, error.response_error().code());
+                        }
+                    }
+                }
+            }
+            let selection = selection.into_iter().collect::<Vec<_>>();
+            let fetched = match groups.fetch(&group, Some(&selection)).await {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    return offset_fetch_global_error(Some(topics), error.response_error());
+                }
+            };
+            let fetched = fetched
+                .into_iter()
+                .map(|offset| (offset.topic_partition, offset.committed))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            OffsetFetchResponse::default().with_topics(
+                topics
+                    .into_iter()
+                    .map(|topic| {
+                        let name = topic.name.0.as_str().to_owned();
+                        let partitions = topic
+                            .partition_indexes
+                            .into_iter()
+                            .map(|partition| {
+                                let key = TopicPartition::new(name.clone(), partition);
+                                let error_code = local_errors.get(&key).copied().unwrap_or(0);
+                                let committed = fetched.get(&key).and_then(Option::as_ref);
+                                offset_fetch_partition(partition, committed, error_code)
+                            })
+                            .collect();
+                        OffsetFetchResponseTopic::default()
+                            .with_name(topic_name(name))
+                            .with_partitions(partitions)
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+fn offset_fetch_partition(
+    partition: i32,
+    committed: Option<&CommittedOffset>,
+    error_code: i16,
+) -> OffsetFetchResponsePartition {
+    OffsetFetchResponsePartition::default()
+        .with_partition_index(partition)
+        .with_committed_offset(committed.map_or(-1, |committed| committed.offset))
+        .with_metadata(
+            committed
+                .and_then(|committed| committed.metadata.as_ref())
+                .map(|metadata| StrBytes::from_string(metadata.clone())),
+        )
+        .with_error_code(error_code)
+}
+
+fn offset_fetch_global_error(
+    topics: Option<Vec<kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic>>,
+    error: ResponseError,
+) -> OffsetFetchResponse {
+    OffsetFetchResponse::default()
+        .with_error_code(error.code())
+        .with_topics(
+            topics
+                .unwrap_or_default()
+                .into_iter()
+                .map(|topic| {
+                    OffsetFetchResponseTopic::default()
+                        .with_name(topic.name)
+                        .with_partitions(
+                            topic
+                                .partition_indexes
+                                .into_iter()
+                                .map(|partition| offset_fetch_partition(partition, None, 0))
+                                .collect(),
+                        )
+                })
+                .collect(),
+        )
+}
+
 fn log_error_code(error: &LogError) -> i16 {
     match error {
         LogError::InvalidTopic { .. } => ResponseError::InvalidTopicException.code(),
@@ -518,6 +877,13 @@ fn encode_response(
             | (ApiKey::Fetch, ResponseKind::Fetch(_))
             | (ApiKey::ListOffsets, ResponseKind::ListOffsets(_))
             | (ApiKey::Metadata, ResponseKind::Metadata(_))
+            | (ApiKey::OffsetCommit, ResponseKind::OffsetCommit(_))
+            | (ApiKey::OffsetFetch, ResponseKind::OffsetFetch(_))
+            | (ApiKey::FindCoordinator, ResponseKind::FindCoordinator(_))
+            | (ApiKey::JoinGroup, ResponseKind::JoinGroup(_))
+            | (ApiKey::Heartbeat, ResponseKind::Heartbeat(_))
+            | (ApiKey::LeaveGroup, ResponseKind::LeaveGroup(_))
+            | (ApiKey::SyncGroup, ResponseKind::SyncGroup(_))
             | (ApiKey::ApiVersions, ResponseKind::ApiVersions(_))
     ));
     Ok(encoded.freeze())
@@ -565,12 +931,21 @@ mod tests {
     use kafka_protocol::{
         indexmap::IndexMap,
         messages::{
-            RequestHeader, TransactionalId,
+            GroupId, RequestHeader, TransactionalId,
             api_versions_request::ApiVersionsRequest,
             fetch_request::{FetchPartition, FetchTopic},
+            find_coordinator_request::FindCoordinatorRequest,
+            heartbeat_request::HeartbeatRequest,
+            join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol},
+            leave_group_request::LeaveGroupRequest,
             list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
             metadata_request::MetadataRequestTopic,
+            offset_commit_request::{
+                OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+            },
+            offset_fetch_request::{OffsetFetchRequest, OffsetFetchRequestTopic},
             produce_request::{PartitionProduceData, TopicProduceData},
+            sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment},
         },
         records::{
             NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE, Record, RecordBatchDecoder,
@@ -579,13 +954,15 @@ mod tests {
     };
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
-        memory::InMemory, path::Path,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as StoreResult, memory::InMemory, path::Path,
     };
 
     use super::*;
     use crate::{
         codec::{MAX_BATCH_RECORDS, MAX_HEADERS_PER_REQUEST},
+        coordinator::{GroupCoordinator, JoinProtocol, SyncAssignment},
+        group::GroupStore,
         log::encode_records,
     };
 
@@ -726,6 +1103,23 @@ mod tests {
         version: i16,
         request: RequestKind,
     ) -> (usize, ResponseKind) {
+        let groups = GroupCoordinator::new(
+            GroupStore::new(
+                Arc::new(InMemory::new()),
+                "walstream/clusters/protocol-groups",
+            )
+            .unwrap(),
+        );
+        wire_round_trip_with_groups(engine, &groups, api_key, version, request).await
+    }
+
+    async fn wire_round_trip_with_groups(
+        engine: &LogEngine,
+        groups: &GroupCoordinator,
+        api_key: ApiKey,
+        version: i16,
+        request: RequestKind,
+    ) -> (usize, ResponseKind) {
         let identity = BrokerIdentity {
             host: "localhost".into(),
             port: 9092,
@@ -734,6 +1128,7 @@ mod tests {
         let response = handle_request(
             request_bytes(api_key, version, 71, request),
             engine,
+            groups,
             &identity,
         )
         .await
@@ -1277,6 +1672,13 @@ mod tests {
             port: 9092,
             cluster_id: "matrix".into(),
         };
+        let groups = GroupCoordinator::new(
+            GroupStore::new(
+                Arc::new(InMemory::new()),
+                "walstream/clusters/version-groups",
+            )
+            .unwrap(),
+        );
         for (api_key, version) in [
             (ApiKey::Produce, 6),
             (ApiKey::Produce, 8),
@@ -1286,9 +1688,29 @@ mod tests {
             (ApiKey::ListOffsets, 4),
             (ApiKey::Metadata, 3),
             (ApiKey::Metadata, 5),
+            (ApiKey::OffsetCommit, 1),
+            (ApiKey::OffsetCommit, 3),
+            (ApiKey::OffsetFetch, 2),
+            (ApiKey::OffsetFetch, 4),
+            (ApiKey::FindCoordinator, 1),
+            (ApiKey::FindCoordinator, 3),
+            (ApiKey::JoinGroup, 1),
+            (ApiKey::JoinGroup, 3),
+            (ApiKey::Heartbeat, 0),
+            (ApiKey::Heartbeat, 2),
+            (ApiKey::LeaveGroup, 0),
+            (ApiKey::LeaveGroup, 2),
+            (ApiKey::SyncGroup, 0),
+            (ApiKey::SyncGroup, 2),
         ] {
             assert!(matches!(
-                handle_request(bare_request_bytes(api_key, version, 90), &engine, &identity).await,
+                handle_request(
+                    bare_request_bytes(api_key, version, 90),
+                    &engine,
+                    &groups,
+                    &identity,
+                )
+                .await,
                 Err(ProtocolError::UnsupportedVersion { .. })
             ));
         }
@@ -1368,6 +1790,483 @@ mod tests {
         assert_eq!(
             response.topics[0].partitions[0].error_code,
             ResponseError::UnknownTopicOrPartition.code()
+        );
+    }
+
+    #[tokio::test]
+    async fn classic_group_wire_lifecycle_commits_and_recovers_offsets() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let engine = LogEngine::new(store.clone(), "walstream/clusters/group-wire").unwrap();
+        engine.ensure_topic("events", 0).await.unwrap();
+        let groups = GroupCoordinator::new(
+            GroupStore::new(store.clone(), "walstream/clusters/group-wire").unwrap(),
+        );
+
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::FindCoordinator,
+            2,
+            RequestKind::FindCoordinator(
+                FindCoordinatorRequest::default()
+                    .with_key(StrBytes::from_static_str("workers"))
+                    .with_key_type(0),
+            ),
+        )
+        .await;
+        let ResponseKind::FindCoordinator(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.error_code, 0);
+        assert_eq!(response.node_id, BrokerId(BROKER_ID));
+
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::FindCoordinator,
+            2,
+            RequestKind::FindCoordinator(
+                FindCoordinatorRequest::default()
+                    .with_key(StrBytes::from_static_str("../workers"))
+                    .with_key_type(0),
+            ),
+        )
+        .await;
+        let ResponseKind::FindCoordinator(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.error_code, ResponseError::InvalidGroupId.code());
+
+        let join = || {
+            JoinGroupRequest::default()
+                .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                .with_session_timeout_ms(30_000)
+                .with_rebalance_timeout_ms(30_000)
+                .with_member_id(StrBytes::default())
+                .with_protocol_type(StrBytes::from_static_str("consumer"))
+                .with_protocols(vec![
+                    JoinGroupRequestProtocol::default()
+                        .with_name(StrBytes::from_static_str("range"))
+                        .with_metadata(Bytes::from_static(b"subscription")),
+                ])
+        };
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::JoinGroup,
+            2,
+            RequestKind::JoinGroup(join()),
+        )
+        .await;
+        let ResponseKind::JoinGroup(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.error_code, 0);
+        assert_eq!(response.generation_id, 1);
+        assert_eq!(response.members.len(), 1);
+        let member_id = response.member_id.as_str().to_owned();
+        assert!(!member_id.is_empty());
+
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::JoinGroup,
+            2,
+            RequestKind::JoinGroup(join()),
+        )
+        .await;
+        let ResponseKind::JoinGroup(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(
+            response.error_code,
+            ResponseError::GroupMaxSizeReached.code()
+        );
+
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::Heartbeat,
+            1,
+            RequestKind::Heartbeat(
+                HeartbeatRequest::default()
+                    .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                    .with_generation_id(2)
+                    .with_member_id(StrBytes::from_string(member_id.clone())),
+            ),
+        )
+        .await;
+        let ResponseKind::Heartbeat(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.error_code, ResponseError::IllegalGeneration.code());
+
+        let assignment = Bytes::from_static(b"partition-0");
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::SyncGroup,
+            1,
+            RequestKind::SyncGroup(
+                SyncGroupRequest::default()
+                    .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                    .with_generation_id(1)
+                    .with_member_id(StrBytes::from_string(member_id.clone()))
+                    .with_assignments(vec![
+                        SyncGroupRequestAssignment::default()
+                            .with_member_id(StrBytes::from_string(member_id.clone()))
+                            .with_assignment(assignment.clone()),
+                    ]),
+            ),
+        )
+        .await;
+        let ResponseKind::SyncGroup(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.error_code, 0);
+        assert_eq!(response.assignment, assignment);
+
+        let invalid_commit = OffsetCommitRequest::default()
+            .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+            .with_generation_id_or_member_epoch(1)
+            .with_member_id(StrBytes::from_string(member_id.clone()))
+            .with_retention_time_ms(-1)
+            .with_topics(vec![
+                OffsetCommitRequestTopic::default()
+                    .with_name(topic_name("events".into()))
+                    .with_partitions(vec![
+                        OffsetCommitRequestPartition::default()
+                            .with_partition_index(0)
+                            .with_committed_offset(4),
+                        OffsetCommitRequestPartition::default()
+                            .with_partition_index(1)
+                            .with_committed_offset(2),
+                    ]),
+            ]);
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::OffsetCommit,
+            2,
+            RequestKind::OffsetCommit(invalid_commit),
+        )
+        .await;
+        let ResponseKind::OffsetCommit(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert!(response.topics[0].partitions.iter().all(|partition| {
+            partition.error_code == ResponseError::UnknownTopicOrPartition.code()
+        }));
+        assert!(groups.fetch("workers", None).await.unwrap().is_empty());
+
+        let negative_commit = OffsetCommitRequest::default()
+            .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+            .with_generation_id_or_member_epoch(1)
+            .with_member_id(StrBytes::from_string(member_id.clone()))
+            .with_retention_time_ms(-1)
+            .with_topics(vec![
+                OffsetCommitRequestTopic::default()
+                    .with_name(topic_name("events".into()))
+                    .with_partitions(vec![
+                        OffsetCommitRequestPartition::default()
+                            .with_partition_index(0)
+                            .with_committed_offset(-1),
+                    ]),
+            ]);
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::OffsetCommit,
+            2,
+            RequestKind::OffsetCommit(negative_commit),
+        )
+        .await;
+        let ResponseKind::OffsetCommit(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(
+            response.topics[0].partitions[0].error_code,
+            ResponseError::InvalidCommitOffsetSize.code()
+        );
+
+        let valid_commit = OffsetCommitRequest::default()
+            .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+            .with_generation_id_or_member_epoch(1)
+            .with_member_id(StrBytes::from_string(member_id.clone()))
+            .with_retention_time_ms(-1)
+            .with_topics(vec![
+                OffsetCommitRequestTopic::default()
+                    .with_name(topic_name("events".into()))
+                    .with_partitions(vec![
+                        OffsetCommitRequestPartition::default()
+                            .with_partition_index(0)
+                            .with_committed_offset(4)
+                            .with_committed_metadata(Some(StrBytes::from_static_str("done"))),
+                    ]),
+            ]);
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::OffsetCommit,
+            2,
+            RequestKind::OffsetCommit(valid_commit),
+        )
+        .await;
+        let ResponseKind::OffsetCommit(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.topics[0].partitions[0].error_code, 0);
+
+        let fetch = || {
+            OffsetFetchRequest::default()
+                .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                .with_topics(Some(vec![
+                    OffsetFetchRequestTopic::default()
+                        .with_name(topic_name("events".into()))
+                        .with_partition_indexes(vec![0]),
+                ]))
+        };
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::OffsetFetch,
+            3,
+            RequestKind::OffsetFetch(fetch()),
+        )
+        .await;
+        let ResponseKind::OffsetFetch(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.error_code, 0);
+        assert_eq!(response.topics[0].partitions[0].committed_offset, 4);
+        assert_eq!(
+            response.topics[0].partitions[0]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "done"
+        );
+
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::LeaveGroup,
+            1,
+            RequestKind::LeaveGroup(
+                LeaveGroupRequest::default()
+                    .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                    .with_member_id(StrBytes::from_string(member_id.clone())),
+            ),
+        )
+        .await;
+        let ResponseKind::LeaveGroup(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.error_code, 0);
+
+        let recovered =
+            GroupCoordinator::new(GroupStore::new(store, "walstream/clusters/group-wire").unwrap());
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &recovered,
+            ApiKey::OffsetFetch,
+            3,
+            RequestKind::OffsetFetch(fetch()),
+        )
+        .await;
+        let ResponseKind::OffsetFetch(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.topics[0].partitions[0].committed_offset, 4);
+
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &recovered,
+            ApiKey::Heartbeat,
+            1,
+            RequestKind::Heartbeat(
+                HeartbeatRequest::default()
+                    .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                    .with_generation_id(1)
+                    .with_member_id(StrBytes::from_string(member_id)),
+            ),
+        )
+        .await;
+        let ResponseKind::Heartbeat(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(response.error_code, ResponseError::UnknownMemberId.code());
+    }
+
+    #[tokio::test]
+    async fn offset_protocol_preserves_null_metadata_and_localizes_fetch_errors() {
+        let store = Arc::new(InMemory::new());
+        let groups = GroupCoordinator::new(
+            GroupStore::new(store.clone(), "walstream/clusters/offset-semantics").unwrap(),
+        );
+        let joined = groups
+            .join(
+                "workers",
+                30_000,
+                "",
+                "consumer",
+                &[JoinProtocol {
+                    name: "range".into(),
+                    metadata: Bytes::from_static(b"subscription"),
+                }],
+            )
+            .await
+            .unwrap();
+        groups
+            .sync(
+                "workers",
+                joined.generation_id,
+                &joined.member_id,
+                &[SyncAssignment {
+                    member_id: joined.member_id.clone(),
+                    assignment: Bytes::from_static(b"partition-0"),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let commit_request = |retention_time_ms| {
+            OffsetCommitRequest::default()
+                .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                .with_generation_id_or_member_epoch(joined.generation_id)
+                .with_member_id(StrBytes::from_string(joined.member_id.clone()))
+                .with_retention_time_ms(retention_time_ms)
+                .with_topics(vec![
+                    OffsetCommitRequestTopic::default()
+                        .with_name(topic_name("events".into()))
+                        .with_partitions(vec![
+                            OffsetCommitRequestPartition::default()
+                                .with_partition_index(0)
+                                .with_committed_offset(4)
+                                .with_committed_metadata(Some(StrBytes::from_static_str("done"))),
+                        ]),
+                    OffsetCommitRequestTopic::default()
+                        .with_name(topic_name("none".into()))
+                        .with_partitions(vec![
+                            OffsetCommitRequestPartition::default()
+                                .with_partition_index(0)
+                                .with_committed_offset(5)
+                                .with_committed_metadata(None),
+                        ]),
+                    OffsetCommitRequestTopic::default()
+                        .with_name(topic_name("empty".into()))
+                        .with_partitions(vec![
+                            OffsetCommitRequestPartition::default()
+                                .with_partition_index(0)
+                                .with_committed_offset(6)
+                                .with_committed_metadata(Some(StrBytes::from_static_str(""))),
+                        ]),
+                ])
+        };
+
+        let rejected = offset_commit_response(commit_request(60_000), &groups).await;
+        assert!(rejected.topics.iter().all(|topic| {
+            topic
+                .partitions
+                .iter()
+                .all(|partition| partition.error_code == ResponseError::InvalidRequest.code())
+        }));
+        assert!(groups.fetch("workers", None).await.unwrap().is_empty());
+
+        let committed = offset_commit_response(commit_request(-1), &groups).await;
+        assert!(committed.topics.iter().all(|topic| {
+            topic
+                .partitions
+                .iter()
+                .all(|partition| partition.error_code == 0)
+        }));
+
+        let fetched = offset_fetch_response(
+            OffsetFetchRequest::default()
+                .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                .with_topics(Some(vec![
+                    OffsetFetchRequestTopic::default()
+                        .with_name(topic_name("events".into()))
+                        .with_partition_indexes(vec![0, 1]),
+                    OffsetFetchRequestTopic::default()
+                        .with_name(topic_name("none".into()))
+                        .with_partition_indexes(vec![0]),
+                    OffsetFetchRequestTopic::default()
+                        .with_name(topic_name("empty".into()))
+                        .with_partition_indexes(vec![0]),
+                    OffsetFetchRequestTopic::default()
+                        .with_name(topic_name("absent".into()))
+                        .with_partition_indexes(vec![0]),
+                ])),
+            &groups,
+        )
+        .await;
+        assert_eq!(fetched.error_code, 0);
+        assert_eq!(fetched.topics[0].partitions[0].committed_offset, 4);
+        assert_eq!(
+            fetched.topics[0].partitions[0]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "done"
+        );
+        assert_eq!(
+            fetched.topics[0].partitions[1].error_code,
+            ResponseError::UnknownTopicOrPartition.code()
+        );
+        assert_eq!(fetched.topics[1].partitions[0].committed_offset, 5);
+        assert!(fetched.topics[1].partitions[0].metadata.is_none());
+        assert_eq!(fetched.topics[2].partitions[0].committed_offset, 6);
+        assert_eq!(
+            fetched.topics[2].partitions[0]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            ""
+        );
+        assert_eq!(fetched.topics[3].partitions[0].committed_offset, -1);
+        assert!(fetched.topics[3].partitions[0].metadata.is_none());
+
+        let invalid_group = offset_fetch_response(
+            OffsetFetchRequest::default()
+                .with_group_id(GroupId(StrBytes::from_static_str("../workers")))
+                .with_topics(Some(vec![
+                    OffsetFetchRequestTopic::default()
+                        .with_name(topic_name("events".into()))
+                        .with_partition_indexes(vec![0]),
+                ])),
+            &groups,
+        )
+        .await;
+        assert_eq!(
+            invalid_group.error_code,
+            ResponseError::InvalidGroupId.code()
+        );
+
+        store
+            .put(
+                &Path::from("walstream/clusters/offset-semantics/groups/broken/offsets.json"),
+                PutPayload::from_static(b"corrupt"),
+            )
+            .await
+            .unwrap();
+        let storage_error = offset_fetch_response(
+            OffsetFetchRequest::default()
+                .with_group_id(GroupId(StrBytes::from_static_str("broken")))
+                .with_topics(Some(vec![
+                    OffsetFetchRequestTopic::default()
+                        .with_name(topic_name("events".into()))
+                        .with_partition_indexes(vec![0]),
+                ])),
+            &groups,
+        )
+        .await;
+        assert_eq!(
+            storage_error.error_code,
+            ResponseError::KafkaStorageError.code()
         );
     }
 }
