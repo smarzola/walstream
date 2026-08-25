@@ -12,6 +12,7 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::{
+    coordinator::GroupCoordinator,
     log::LogEngine,
     protocol::{BrokerIdentity, handle_request},
 };
@@ -36,6 +37,7 @@ pub fn validate_max_frame_bytes(max_frame_bytes: usize) -> Result<()> {
 pub async fn serve<F>(
     listener: TcpListener,
     engine: LogEngine,
+    groups: GroupCoordinator,
     identity: BrokerIdentity,
     max_frame_bytes: usize,
     shutdown: F,
@@ -47,6 +49,7 @@ where
     validate_max_frame_bytes(max_frame_bytes)?;
 
     let engine = Arc::new(engine);
+    let groups = Arc::new(groups);
     let identity = Arc::new(identity);
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
@@ -61,10 +64,11 @@ where
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("accept Kafka connection")?;
                 let engine = Arc::clone(&engine);
+                let groups = Arc::clone(&groups);
                 let identity = Arc::clone(&identity);
                 connections.spawn(async move {
                     debug!(%peer, "accepted Kafka connection");
-                    let result = serve_connection(stream, &engine, &identity, max_frame_bytes).await;
+                    let result = serve_connection(stream, &engine, &groups, &identity, max_frame_bytes).await;
                     if let Err(error) = &result {
                         warn!(%peer, %error, "closing Kafka connection");
                     }
@@ -95,6 +99,7 @@ fn report_connection_result(result: Result<Result<()>, tokio::task::JoinError>) 
 async fn serve_connection(
     mut stream: TcpStream,
     engine: &LogEngine,
+    groups: &GroupCoordinator,
     identity: &BrokerIdentity,
     max_frame_bytes: usize,
 ) -> Result<()> {
@@ -120,7 +125,8 @@ async fn serve_connection(
             .read_exact(&mut frame)
             .await
             .context("read Kafka frame body")?;
-        if let Some(response) = handle_request(Bytes::from(frame), engine, identity).await? {
+        if let Some(response) = handle_request(Bytes::from(frame), engine, groups, identity).await?
+        {
             let response_length = i32::try_from(response.len())
                 .context("Kafka response exceeds signed 32-bit frame size")?;
             stream

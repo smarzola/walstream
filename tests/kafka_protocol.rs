@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::{Buf, Bytes};
 use kafka_protocol::{messages::api_versions_response::ApiVersionsResponse, protocol::Decodable};
@@ -8,6 +8,8 @@ use tokio::{
     sync::oneshot,
 };
 use walstream::{
+    coordinator::GroupCoordinator,
+    group::GroupStore,
     log::LogEngine,
     protocol::{BrokerIdentity, SUPPORTED_APIS},
     server::serve,
@@ -53,6 +55,13 @@ async fn handles_fragmented_and_pipelined_frames_with_correlation_ids() {
     let server = tokio::spawn(serve(
         listener,
         LogEngine::in_memory("walstream/clusters/protocol").unwrap(),
+        GroupCoordinator::new(
+            GroupStore::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                "walstream/clusters/protocol-groups",
+            )
+            .unwrap(),
+        ),
         BrokerIdentity {
             host: "127.0.0.1".into(),
             port: address.port(),
@@ -105,6 +114,13 @@ async fn closes_connections_for_unsupported_apis_and_oversized_frames() {
     let server = tokio::spawn(serve(
         listener,
         LogEngine::in_memory("walstream/clusters/bounds").unwrap(),
+        GroupCoordinator::new(
+            GroupStore::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                "walstream/clusters/bound-groups",
+            )
+            .unwrap(),
+        ),
         BrokerIdentity {
             host: "127.0.0.1".into(),
             port: address.port(),
@@ -146,6 +162,22 @@ async fn closes_connections_for_unsupported_apis_and_oversized_frames() {
     metadata[0..4].copy_from_slice(&body_length.to_be_bytes());
     count_bomb.write_all(&metadata).await.unwrap();
     assert_connection_closed(&mut count_bomb).await;
+
+    let mut group_count_bomb = TcpStream::connect(address).await.unwrap();
+    let mut join = request(11, 2, 5);
+    for value in ["g", "", "consumer"] {
+        join.extend_from_slice(&(value.len() as i16).to_be_bytes());
+        join.extend_from_slice(value.as_bytes());
+        if value == "g" {
+            join.extend_from_slice(&30_000_i32.to_be_bytes());
+            join.extend_from_slice(&30_000_i32.to_be_bytes());
+        }
+    }
+    join.extend_from_slice(&i32::MAX.to_be_bytes());
+    let body_length = i32::try_from(join.len() - 4).unwrap();
+    join[0..4].copy_from_slice(&body_length.to_be_bytes());
+    group_count_bomb.write_all(&join).await.unwrap();
+    assert_connection_closed(&mut group_count_bomb).await;
 
     shutdown_tx.send(()).unwrap();
     server.await.unwrap().unwrap();

@@ -6,6 +6,8 @@ use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use walstream::config::S3Settings;
+use walstream::coordinator::GroupCoordinator;
+use walstream::group::GroupStore;
 use walstream::log::LogEngine;
 use walstream::protocol::BrokerIdentity;
 use walstream::server::{DEFAULT_MAX_FRAME_BYTES, serve, validate_max_frame_bytes};
@@ -80,10 +82,12 @@ async fn main() -> Result<()> {
             // credentialed object-store request or socket bind.
             let identity = settings.preflight()?;
             let store = build_s3_store(&settings.s3)?;
-            verify_store_contract(store.as_ref(), &settings.s3.cluster_prefix())
+            let cluster_prefix = settings.s3.cluster_prefix();
+            verify_store_contract(store.as_ref(), &cluster_prefix)
                 .await
                 .context("object store does not satisfy Walstream's conditional-write contract")?;
-            let engine = LogEngine::new(store, settings.s3.cluster_prefix())?;
+            let engine = LogEngine::new(store.clone(), cluster_prefix.clone())?;
+            let groups = GroupCoordinator::new(GroupStore::new(store, cluster_prefix)?);
             let listener = TcpListener::bind(settings.listen)
                 .await
                 .with_context(|| format!("bind Kafka listener {}", settings.listen))?;
@@ -92,6 +96,7 @@ async fn main() -> Result<()> {
             serve(
                 listener,
                 engine,
+                groups,
                 identity,
                 settings.max_frame_bytes,
                 async {
