@@ -210,6 +210,7 @@ Inspect every failure. Fix in-scope regressions rather than weakening tests. Doc
 - 2026-09-01: Validate records and the prospective partition range before topic metadata creation so rejected Produce requests remain side-effect free.
 - 2026-09-01: Coordinate each classic group through bounded Joining, AwaitingSync, and Stable phases. The elected leader chooses the first protocol common to every member, receives selected-protocol metadata for all members, and atomically installs exactly one opaque assignment per member.
 - 2026-09-01: Real-client probes create all three logs with seed records and use a one-member seed phase to initialize durable group offsets. The measured two-member phase disables offset reset, commits the next generation on every partition, and requires the retained survivor to resume at exactly the committed next offsets after replacement. Missing replacement offsets therefore fail instead of aliasing the current log end.
+- 2026-09-01: JoinGroup completion is non-destructive and scoped to the rebalance a request joined. Overlapping retries for one member receive the same outcome, while a superseded waiter receives `REBALANCE_IN_PROGRESS` instead of a stale generation.
 
 ## Resume Protocol
 
@@ -217,4 +218,6 @@ On resume, read this contract, repository instructions, `git status`, status not
 
 ## Final Report
 
-Lead with `Achieved` or `Not achieved`, then report target-state and success-criteria status, milestone commits, files changed, exact verification results, reviewer rounds and disposition, residual risks, and any unauthorized external delivery step that remains.
+Achieved on 2026-09-01. All target-state bullets and success criteria are satisfied: durable bounded multi-partition topics preserve legacy data; dynamic classic groups coordinate bounded members through complete immutable assignments and retry-safe rebalances; durable offsets remain generation-fenced; and both pinned client families prove split, leave reassignment, and retained-survivor recovery across complete broker replacement.
+
+Final verification passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets` (64 library, 1 binary, 3 protocol, and 2 stock-client tests passed; 1 script-gated live test ignored), shell syntax checks, both pinned real-client probes, and the RustFS, SeaweedFS, and MinIO live matrix. Milestone reviews required two repair rounds for milestone 1, one for milestone 2, and one for milestone 3. The fresh independent final audit found a JoinGroup retry race and inaccurate OffsetCommit wording; both were repaired, the complete gate passed again, and re-audit reported no blocking findings. Work remains local because this goal did not authorize push, pull request, merge, or release.

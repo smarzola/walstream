@@ -58,7 +58,7 @@ Walstream advertises only this exercised wire surface:
 | SyncGroup | 1 | Exact leader-provided opaque assignment; followers wait |
 | Heartbeat | 1 | Process-local session deadline |
 | LeaveGroup | 1 | Releases ephemeral membership |
-| OffsetCommit | 2 | Atomic durable next-offset commit; default retention only |
+| OffsetCommit | 2 | One CAS for the valid subset; partition-local errors; default retention only |
 | OffsetFetch | 3 | Selected or all durable group offsets |
 
 Unsupported APIs and adjacent versions close the connection or return an explicit Kafka error. Out-of-range partitions, follower reads, invalid offsets, transactions, idempotent/control batches, compression, duplicate header keys, and malformed data are never acknowledged as successful.

@@ -176,7 +176,7 @@ impl GroupCoordinator {
         let now = Instant::now();
         let session_timeout = Duration::from_millis(session_timeout_ms as u64);
         let rebalance_timeout = Duration::from_millis(rebalance_timeout_ms as u64);
-        let assigned_member_id = {
+        let (assigned_member_id, target_rebalance_id) = {
             let mut state = slot.state.lock().await;
             let changed = advance_group(&mut state, now)?;
             if changed {
@@ -209,7 +209,7 @@ impl GroupCoordinator {
                         leader_id: assigned.clone(),
                         members,
                     });
-                    assigned
+                    (assigned, 1)
                 }
                 None => return Err(CoordinatorError::kafka(ResponseError::UnknownMemberId)),
                 Some(group_state) => {
@@ -272,7 +272,7 @@ impl GroupCoordinator {
                         .map(|member| now + member.rebalance_timeout)
                         .max()
                         .unwrap_or(now + rebalance_timeout);
-                    assigned
+                    (assigned, group_state.rebalance_id)
                 }
             }
         };
@@ -299,11 +299,14 @@ impl GroupCoordinator {
                 let group_state = state
                     .as_mut()
                     .ok_or_else(|| CoordinatorError::kafka(ResponseError::UnknownMemberId))?;
+                if group_state.rebalance_id != target_rebalance_id {
+                    return Err(CoordinatorError::kafka(ResponseError::RebalanceInProgress));
+                }
                 let member = group_state
                     .members
                     .get_mut(&assigned_member_id)
                     .ok_or_else(|| CoordinatorError::kafka(ResponseError::UnknownMemberId))?;
-                if let Some(outcome) = member.join_result.take() {
+                if let Some(outcome) = member.join_result.clone() {
                     return Ok(outcome);
                 }
                 group_state.phase_deadline.min(member.deadline)
@@ -697,6 +700,7 @@ fn start_rebalance(state: &mut GroupState, now: Instant) -> Result<(), Coordinat
         .unwrap_or(now);
     for member in state.members.values_mut() {
         member.assignment = None;
+        member.join_result = None;
     }
     Ok(())
 }
@@ -1681,6 +1685,135 @@ mod tests {
         assert_eq!(first.generation_id, third.generation_id);
         assert_eq!(first.members.len(), 2);
         assert!(third.members.is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_member_join_retry_cannot_consume_another_waiters_completion() {
+        let groups = coordinator(Arc::new(InMemory::new()));
+        let (first, second) = stable_two_members(&groups, "workers").await;
+        let third_join = tokio::spawn({
+            let groups = groups.clone();
+            async move {
+                groups
+                    .join("workers", 30_000, 30_000, "", "consumer", &protocols())
+                    .await
+            }
+        });
+        wait_for_rebalance(&groups, "workers", &first).await;
+
+        let first_retry_protocols = vec![JoinProtocol {
+            name: "range".into(),
+            metadata: Bytes::from_static(b"first-waiter"),
+        }];
+        let abandoned_request = tokio::spawn({
+            let groups = groups.clone();
+            let member_id = first.member_id.clone();
+            let retry_protocols = first_retry_protocols.clone();
+            async move {
+                groups
+                    .join(
+                        "workers",
+                        30_000,
+                        30_000,
+                        &member_id,
+                        "consumer",
+                        &retry_protocols,
+                    )
+                    .await
+            }
+        });
+        wait_for_member_metadata(&groups, "workers", &first.member_id, b"first-waiter").await;
+
+        let second_retry_protocols = vec![JoinProtocol {
+            name: "range".into(),
+            metadata: Bytes::from_static(b"retained-retry"),
+        }];
+        let retained_request = tokio::spawn({
+            let groups = groups.clone();
+            let member_id = first.member_id.clone();
+            let retry_protocols = second_retry_protocols.clone();
+            async move {
+                groups
+                    .join(
+                        "workers",
+                        30_000,
+                        30_000,
+                        &member_id,
+                        "consumer",
+                        &retry_protocols,
+                    )
+                    .await
+            }
+        });
+        wait_for_member_metadata(&groups, "workers", &first.member_id, b"retained-retry").await;
+
+        let second = groups
+            .join(
+                "workers",
+                30_000,
+                30_000,
+                &second.member_id,
+                "consumer",
+                &protocols(),
+            )
+            .await
+            .unwrap();
+        let retained = tokio::time::timeout(Duration::from_secs(2), retained_request)
+            .await
+            .expect("retained JoinGroup retry was stranded")
+            .unwrap()
+            .unwrap();
+        let abandoned = tokio::time::timeout(Duration::from_secs(2), abandoned_request)
+            .await
+            .expect("original JoinGroup waiter was stranded")
+            .unwrap()
+            .unwrap();
+        let third = tokio::time::timeout(Duration::from_secs(2), third_join)
+            .await
+            .expect("new member JoinGroup was stranded")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(retained.member_id, first.member_id);
+        assert_eq!(retained, abandoned);
+        assert_eq!(retained.generation_id, second.generation_id);
+        assert_eq!(retained.generation_id, third.generation_id);
+        assert_eq!(retained.members.len(), 3);
+        assert_eq!(
+            retained
+                .members
+                .iter()
+                .find(|member| member.member_id == retained.member_id)
+                .unwrap()
+                .metadata,
+            Bytes::from_static(b"retained-retry")
+        );
+    }
+
+    async fn wait_for_member_metadata(
+        groups: &GroupCoordinator,
+        group_id: &str,
+        member_id: &str,
+        expected: &[u8],
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let slot = groups.existing_group_slot(group_id).await.unwrap();
+                let state = slot.state.lock().await;
+                let group = state.as_ref().unwrap();
+                let member = group.members.get(member_id).unwrap();
+                if group.phase == GroupPhase::Joining
+                    && member.joined_rebalance == group.rebalance_id
+                    && member.protocols[0].metadata.as_ref() == expected
+                {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("JoinGroup waiter did not register its member metadata");
     }
 
     #[tokio::test]
