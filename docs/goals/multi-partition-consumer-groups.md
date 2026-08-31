@@ -75,7 +75,7 @@ The goal is complete only when:
 ## Milestones
 
 - [x] Milestone 1: Durable multi-partition topics and partition-aware data APIs
-- [ ] Milestone 2: Bounded multi-member classic group coordination
+- [x] Milestone 2: Bounded multi-member classic group coordination
 - [ ] Milestone 3: Real-client rebalance/recovery proof and operator documentation
 
 ### Checkpoint Protocol
@@ -149,7 +149,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Status: Not started.
+Status: Complete on 2026-09-01. Added bounded multi-member Joining, AwaitingSync, and Stable phases; common protocol negotiation and leader-only member metadata; exact immutable leader assignments with waiting followers; generation-fenced heartbeats and commits; leave/expiry rebalances; and concurrent JoinGroup v2/SyncGroup v1 wire coverage. Aggregate retained protocol and assignment bytes are checked before mutation. Verification: `cargo test --all-targets coordinator` (15 matching tests passed), `cargo test --all-targets consumer_group` (1 matching test passed), `cargo test --test kafka_protocol` (3 passed), `cargo fmt --all -- --check` (passed), and `cargo clippy --all-targets --all-features -- -D warnings` (passed). Adversarial review required one repair round for Stable assignment immutability, leave-during-join convergence, aggregate byte budgets, and unknown-member error precedence; all findings were resolved and the reviewer reported no blocking findings.
 
 ## Milestone 3: Real-Client Parallel Recovery
 
@@ -208,6 +208,7 @@ Inspect every failure. Fix in-scope regressions rather than weakening tests. Doc
 - 2026-09-01: Keep assignment client-computed. The broker coordinates membership and distributes opaque leader-provided assignments, matching the classic protocol boundary.
 - 2026-09-01: Topic metadata is the durable topic-existence record. A valid partition without a manifest is an empty log; manifests remain lazy so creating a 1024-partition topic does not require 1024 object writes.
 - 2026-09-01: Validate records and the prospective partition range before topic metadata creation so rejected Produce requests remain side-effect free.
+- 2026-09-01: Coordinate each classic group through bounded Joining, AwaitingSync, and Stable phases. The elected leader chooses the first protocol common to every member, receives selected-protocol metadata for all members, and atomically installs exactly one opaque assignment per member.
 
 ## Resume Protocol
 

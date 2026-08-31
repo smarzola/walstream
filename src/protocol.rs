@@ -566,6 +566,7 @@ async fn join_group_response(
         .join(
             request.group_id.0.as_str(),
             request.session_timeout_ms,
+            request.rebalance_timeout_ms,
             request.member_id.as_str(),
             request.protocol_type.as_str(),
             &protocols,
@@ -577,11 +578,17 @@ async fn join_group_response(
             .with_protocol_name(Some(StrBytes::from_string(joined.protocol_name)))
             .with_leader(StrBytes::from_string(joined.leader_id.clone()))
             .with_member_id(StrBytes::from_string(joined.member_id.clone()))
-            .with_members(vec![
-                JoinGroupResponseMember::default()
-                    .with_member_id(StrBytes::from_string(joined.member_id))
-                    .with_metadata(joined.member_metadata),
-            ]),
+            .with_members(
+                joined
+                    .members
+                    .into_iter()
+                    .map(|member| {
+                        JoinGroupResponseMember::default()
+                            .with_member_id(StrBytes::from_string(member.member_id))
+                            .with_metadata(member.metadata)
+                    })
+                    .collect(),
+            ),
         Err(error) => JoinGroupResponse::default().with_error_code(error.response_error().code()),
     }
 }
@@ -1887,6 +1894,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_group_v2_and_sync_group_v1_coordinate_two_wire_members() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let engine = LogEngine::new(store.clone(), "walstream/clusters/two-member-wire").unwrap();
+        let groups = GroupCoordinator::new(
+            GroupStore::new(store, "walstream/clusters/two-member-wire").unwrap(),
+        );
+        let join = |member_id: String| {
+            RequestKind::JoinGroup(
+                JoinGroupRequest::default()
+                    .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                    .with_session_timeout_ms(30_000)
+                    .with_rebalance_timeout_ms(30_000)
+                    .with_member_id(StrBytes::from_string(member_id))
+                    .with_protocol_type(StrBytes::from_static_str("consumer"))
+                    .with_protocols(vec![
+                        JoinGroupRequestProtocol::default()
+                            .with_name(StrBytes::from_static_str("range"))
+                            .with_metadata(Bytes::from_static(b"subscription")),
+                    ]),
+            )
+        };
+
+        let (_, first) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::JoinGroup,
+            2,
+            join(String::new()),
+        )
+        .await;
+        let ResponseKind::JoinGroup(first) = first else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(first.error_code, 0);
+        let first_id = first.member_id.as_str().to_owned();
+        let (_, first_sync) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::SyncGroup,
+            1,
+            RequestKind::SyncGroup(
+                SyncGroupRequest::default()
+                    .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                    .with_generation_id(first.generation_id)
+                    .with_member_id(StrBytes::from_string(first_id.clone()))
+                    .with_assignments(vec![
+                        SyncGroupRequestAssignment::default()
+                            .with_member_id(StrBytes::from_string(first_id.clone()))
+                            .with_assignment(Bytes::from_static(b"partition-0")),
+                    ]),
+            ),
+        )
+        .await;
+        let ResponseKind::SyncGroup(first_sync) = first_sync else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(first_sync.error_code, 0);
+
+        let second_join = tokio::spawn({
+            let engine = engine.clone();
+            let groups = groups.clone();
+            let request = join(String::new());
+            async move {
+                wire_round_trip_with_groups(&engine, &groups, ApiKey::JoinGroup, 2, request).await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match groups
+                    .heartbeat("workers", first.generation_id, &first_id)
+                    .await
+                {
+                    Err(error) if error.response_error() == ResponseError::RebalanceInProgress => {
+                        break;
+                    }
+                    Ok(()) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected heartbeat error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("second wire member did not trigger rebalance");
+
+        let (_, rejoined_first) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::JoinGroup,
+            2,
+            join(first_id.clone()),
+        )
+        .await;
+        let ResponseKind::JoinGroup(rejoined_first) = rejoined_first else {
+            panic!("unexpected response kind")
+        };
+        let (_, second) = second_join.await.unwrap();
+        let ResponseKind::JoinGroup(second) = second else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(rejoined_first.error_code, 0);
+        assert_eq!(second.error_code, 0);
+        assert_eq!(rejoined_first.generation_id, second.generation_id);
+        assert_eq!(rejoined_first.leader.as_str(), first_id);
+        assert_eq!(rejoined_first.members.len(), 2);
+        assert!(second.members.is_empty());
+        let second_id = second.member_id.as_str().to_owned();
+
+        let follower_sync = tokio::spawn({
+            let engine = engine.clone();
+            let groups = groups.clone();
+            let second_id = second_id.clone();
+            let generation_id = second.generation_id;
+            async move {
+                wire_round_trip_with_groups(
+                    &engine,
+                    &groups,
+                    ApiKey::SyncGroup,
+                    1,
+                    RequestKind::SyncGroup(
+                        SyncGroupRequest::default()
+                            .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                            .with_generation_id(generation_id)
+                            .with_member_id(StrBytes::from_string(second_id))
+                            .with_assignments(Vec::new()),
+                    ),
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!follower_sync.is_finished());
+        let (_, leader_sync) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::SyncGroup,
+            1,
+            RequestKind::SyncGroup(
+                SyncGroupRequest::default()
+                    .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+                    .with_generation_id(rejoined_first.generation_id)
+                    .with_member_id(StrBytes::from_string(first_id.clone()))
+                    .with_assignments(vec![
+                        SyncGroupRequestAssignment::default()
+                            .with_member_id(StrBytes::from_string(first_id))
+                            .with_assignment(Bytes::from_static(b"partitions-0-2")),
+                        SyncGroupRequestAssignment::default()
+                            .with_member_id(StrBytes::from_string(second_id))
+                            .with_assignment(Bytes::from_static(b"partition-1")),
+                    ]),
+            ),
+        )
+        .await;
+        let ResponseKind::SyncGroup(leader_sync) = leader_sync else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(leader_sync.error_code, 0);
+        assert_eq!(
+            leader_sync.assignment,
+            Bytes::from_static(b"partitions-0-2")
+        );
+        let (_, follower_sync) = follower_sync.await.unwrap();
+        let ResponseKind::SyncGroup(follower_sync) = follower_sync else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(follower_sync.error_code, 0);
+        assert_eq!(follower_sync.assignment, Bytes::from_static(b"partition-1"));
+    }
+
+    #[tokio::test]
     async fn classic_group_wire_lifecycle_commits_and_recovers_offsets() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let engine = LogEngine::new(store.clone(), "walstream/clusters/group-wire").unwrap();
@@ -1959,23 +2134,6 @@ mod tests {
         assert_eq!(response.members.len(), 1);
         let member_id = response.member_id.as_str().to_owned();
         assert!(!member_id.is_empty());
-
-        let (_, response) = wire_round_trip_with_groups(
-            &engine,
-            &groups,
-            ApiKey::JoinGroup,
-            2,
-            RequestKind::JoinGroup(join()),
-        )
-        .await;
-        let ResponseKind::JoinGroup(response) = response else {
-            panic!("unexpected response kind")
-        };
-        assert_eq!(
-            response.error_code,
-            ResponseError::GroupMaxSizeReached.code()
-        );
-        assert_eq!(response.protocol_name.as_ref().unwrap().as_str(), "");
 
         let (_, response) = wire_round_trip_with_groups(
             &engine,
@@ -2291,6 +2449,7 @@ mod tests {
         let joined = groups
             .join(
                 "workers",
+                30_000,
                 30_000,
                 "",
                 "consumer",
