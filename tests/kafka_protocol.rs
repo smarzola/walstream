@@ -185,10 +185,15 @@ async fn closes_connections_for_unsupported_apis_and_oversized_frames() {
 
 #[tokio::test]
 async fn metadata_creation_is_durable_and_listed() {
-    let engine = LogEngine::in_memory("walstream/clusters/topics").unwrap();
+    let engine = LogEngine::in_memory_with_partitions("walstream/clusters/topics", 3).unwrap();
     engine.ensure_topic("beta", 0).await.unwrap();
     engine.ensure_topic("alpha", 0).await.unwrap();
     engine.ensure_topic("alpha", 0).await.unwrap();
     assert_eq!(engine.topics().await.unwrap(), vec!["alpha", "beta"]);
+    assert_eq!(
+        engine.topic_partition_count("alpha").await.unwrap(),
+        Some(3)
+    );
     assert_eq!(engine.offsets("alpha", 0).await.unwrap().latest, 0);
+    assert_eq!(engine.offsets("alpha", 2).await.unwrap().latest, 0);
 }

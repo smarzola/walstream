@@ -74,7 +74,7 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: Durable multi-partition topics and partition-aware data APIs
+- [x] Milestone 1: Durable multi-partition topics and partition-aware data APIs
 - [ ] Milestone 2: Bounded multi-member classic group coordination
 - [ ] Milestone 3: Real-client rebalance/recovery proof and operator documentation
 
@@ -119,7 +119,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Status: Not started.
+Status: Complete on 2026-09-01. Added bounded schema-v1 topic metadata, lazy independent partition logs, one-partition legacy inference and non-empty readback, durable partition-aware offsets, serve preflight, and localized OffsetCommit partition errors with request-wide generation fencing. Verification: `cargo test --all-targets multi_partition` (6 matching tests passed), `cargo test --all-targets metadata` (4 matching tests passed), `cargo test --test stock_client` (2 passed), `cargo fmt --all -- --check` (passed), `cargo clippy --all-targets --all-features -- -D warnings` (passed), and `cargo test --all-targets` (59 tests passed, 1 script-gated S3 test ignored). Adversarial review required two repair rounds; all findings were resolved and the reviewer reported no blocking findings.
 
 ## Milestone 2: Multi-Member Classic Groups
 
@@ -206,6 +206,8 @@ Inspect every failure. Fix in-scope regressions rather than weakening tests. Doc
 - 2026-09-01: Use persisted per-topic metadata with a creation-time partition count and a serve-time default of one. This provides configurable auto-creation without adding an admin API.
 - 2026-09-01: Interpret valid legacy partition-0 manifests without topic metadata as one-partition topics to preserve the current durable format.
 - 2026-09-01: Keep assignment client-computed. The broker coordinates membership and distributes opaque leader-provided assignments, matching the classic protocol boundary.
+- 2026-09-01: Topic metadata is the durable topic-existence record. A valid partition without a manifest is an empty log; manifests remain lazy so creating a 1024-partition topic does not require 1024 object writes.
+- 2026-09-01: Validate records and the prospective partition range before topic metadata creation so rejected Produce requests remain side-effect free.
 
 ## Resume Protocol
 

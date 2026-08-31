@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Args, Parser, Subcommand};
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 use walstream::config::S3Settings;
 use walstream::coordinator::GroupCoordinator;
 use walstream::group::GroupStore;
-use walstream::log::LogEngine;
+use walstream::log::{DEFAULT_TOPIC_PARTITIONS, LogEngine, MAX_TOPIC_PARTITIONS};
 use walstream::protocol::BrokerIdentity;
 use walstream::server::{DEFAULT_MAX_FRAME_BYTES, serve, validate_max_frame_bytes};
 use walstream::storage::{build_s3_store, verify_store_contract};
@@ -53,12 +53,25 @@ struct ServeSettings {
         default_value_t = DEFAULT_MAX_FRAME_BYTES
     )]
     max_frame_bytes: usize,
+
+    /// Partition count assigned once when a topic is auto-created.
+    #[arg(
+        long,
+        env = "WALSTREAM_DEFAULT_TOPIC_PARTITIONS",
+        default_value_t = DEFAULT_TOPIC_PARTITIONS
+    )]
+    default_topic_partitions: i32,
 }
 
 impl ServeSettings {
     fn preflight(&self) -> Result<BrokerIdentity> {
         self.s3.validate()?;
         validate_max_frame_bytes(self.max_frame_bytes)?;
+        ensure!(
+            (DEFAULT_TOPIC_PARTITIONS..=MAX_TOPIC_PARTITIONS)
+                .contains(&self.default_topic_partitions),
+            "default topic partitions must be between {DEFAULT_TOPIC_PARTITIONS} and {MAX_TOPIC_PARTITIONS}"
+        );
         let identity = BrokerIdentity {
             host: self.advertised_host.clone(),
             port: self.advertised_port.unwrap_or(self.listen.port()),
@@ -86,7 +99,11 @@ async fn main() -> Result<()> {
             verify_store_contract(store.as_ref(), &cluster_prefix)
                 .await
                 .context("object store does not satisfy Walstream's conditional-write contract")?;
-            let engine = LogEngine::new(store.clone(), cluster_prefix.clone())?;
+            let engine = LogEngine::with_default_topic_partitions(
+                store.clone(),
+                cluster_prefix.clone(),
+                settings.default_topic_partitions,
+            )?;
             let groups = GroupCoordinator::new(GroupStore::new(store, cluster_prefix)?);
             let listener = TcpListener::bind(settings.listen)
                 .await
@@ -135,6 +152,7 @@ mod tests {
             advertised_host: "localhost".into(),
             advertised_port: None,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            default_topic_partitions: DEFAULT_TOPIC_PARTITIONS,
         }
     }
 
@@ -151,6 +169,12 @@ mod tests {
         for maximum in [8, 9] {
             let mut value = settings();
             value.max_frame_bytes = maximum;
+            assert!(value.preflight().is_err());
+        }
+
+        for partition_count in [0, MAX_TOPIC_PARTITIONS + 1] {
+            let mut value = settings();
+            value.default_topic_partitions = partition_count;
             assert!(value.preflight().is_err());
         }
     }

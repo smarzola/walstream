@@ -301,6 +301,9 @@ impl GroupCoordinator {
                 return Err(error);
             }
         }
+        if commits.is_empty() {
+            return Ok(());
+        }
         self.offsets
             .commit(group, commits)
             .await

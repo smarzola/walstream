@@ -241,11 +241,11 @@ pub async fn handle_request(
             true,
         ),
         RequestKind::OffsetCommit(request) => (
-            ResponseKind::OffsetCommit(offset_commit_response(request, groups).await),
+            ResponseKind::OffsetCommit(offset_commit_response(request, groups, engine).await),
             true,
         ),
         RequestKind::OffsetFetch(request) => (
-            ResponseKind::OffsetFetch(offset_fetch_response(request, groups).await),
+            ResponseKind::OffsetFetch(offset_fetch_response(request, groups, engine).await),
             true,
         ),
         _ => return Err(ProtocolError::UnsupportedApi(raw_key)),
@@ -306,13 +306,19 @@ async fn metadata_response(
     for topic in requested {
         let should_create = version < 4 || request.allow_auto_topic_creation;
         let result = if !explicit_topics {
-            Ok(())
+            match engine.topic_partition_count(&topic).await {
+                Ok(Some(partition_count)) => Ok(partition_count),
+                Ok(None) => Err(LogError::UnknownTopic {
+                    topic: topic.clone(),
+                }),
+                Err(error) => Err(error),
+            }
         } else if should_create {
             engine.ensure_topic(&topic, 0).await
         } else {
-            match engine.topic_exists(&topic, 0).await {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(LogError::UnknownTopic {
+            match engine.topic_partition_count(&topic).await {
+                Ok(Some(partition_count)) => Ok(partition_count),
+                Ok(None) => Err(LogError::UnknownTopic {
                     topic: topic.clone(),
                 }),
                 Err(error) => Err(error),
@@ -320,15 +326,19 @@ async fn metadata_response(
         };
 
         let response = match result {
-            Ok(()) => MetadataResponseTopic::default()
+            Ok(partition_count) => MetadataResponseTopic::default()
                 .with_name(Some(topic_name(topic)))
-                .with_partitions(vec![
-                    MetadataResponsePartition::default()
-                        .with_partition_index(0)
-                        .with_leader_id(BrokerId(BROKER_ID))
-                        .with_replica_nodes(vec![BrokerId(BROKER_ID)])
-                        .with_isr_nodes(vec![BrokerId(BROKER_ID)]),
-                ]),
+                .with_partitions(
+                    (0..partition_count)
+                        .map(|partition| {
+                            MetadataResponsePartition::default()
+                                .with_partition_index(partition)
+                                .with_leader_id(BrokerId(BROKER_ID))
+                                .with_replica_nodes(vec![BrokerId(BROKER_ID)])
+                                .with_isr_nodes(vec![BrokerId(BROKER_ID)])
+                        })
+                        .collect(),
+                ),
             Err(LogError::InvalidTopic { .. }) => MetadataResponseTopic::default()
                 .with_name(Some(topic_name(topic)))
                 .with_error_code(ResponseError::InvalidTopicException.code()),
@@ -633,6 +643,7 @@ async fn leave_group_response(
 async fn offset_commit_response(
     request: OffsetCommitRequest,
     groups: &GroupCoordinator,
+    engine: &LogEngine,
 ) -> OffsetCommitResponse {
     let commits = request
         .topics
@@ -649,25 +660,50 @@ async fn offset_commit_response(
             })
         })
         .collect::<Vec<_>>();
-    let error_code = if request.retention_time_ms != -1 {
+    let request_error = if request.retention_time_ms != -1 {
         ResponseError::InvalidRequest.code()
     } else {
+        0
+    };
+    let mut local_errors = std::collections::BTreeMap::new();
+    let mut valid_commits = Vec::with_capacity(commits.len());
+    if request_error == 0 {
+        for commit in &commits {
+            let error_code = match engine.topic_exists(&commit.topic, commit.partition).await {
+                Ok(true) => None,
+                Ok(false) => Some(ResponseError::UnknownTopicOrPartition.code()),
+                Err(error) => Some(log_error_code(&error)),
+            };
+            if let Some(error_code) = error_code {
+                local_errors.insert(
+                    TopicPartition::new(commit.topic.clone(), commit.partition),
+                    error_code,
+                );
+            } else {
+                valid_commits.push(commit.clone());
+            }
+        }
+    }
+    let coordinator_error = if request_error == 0 {
         groups
             .commit(
                 request.group_id.0.as_str(),
                 request.generation_id_or_member_epoch,
                 request.member_id.as_str(),
-                &commits,
+                &valid_commits,
             )
             .await
             .err()
             .map_or(0, |error| error.response_error().code())
+    } else {
+        0
     };
     OffsetCommitResponse::default().with_topics(
         request
             .topics
             .into_iter()
             .map(|topic| {
+                let name = topic.name.0.as_str().to_owned();
                 OffsetCommitResponseTopic::default()
                     .with_name(topic.name)
                     .with_partitions(
@@ -675,6 +711,15 @@ async fn offset_commit_response(
                             .partitions
                             .into_iter()
                             .map(|partition| {
+                                let key =
+                                    TopicPartition::new(name.clone(), partition.partition_index);
+                                let error_code = if request_error != 0 {
+                                    request_error
+                                } else if coordinator_error != 0 {
+                                    coordinator_error
+                                } else {
+                                    local_errors.get(&key).copied().unwrap_or(0)
+                                };
                                 OffsetCommitResponsePartition::default()
                                     .with_partition_index(partition.partition_index)
                                     .with_error_code(error_code)
@@ -689,6 +734,7 @@ async fn offset_commit_response(
 async fn offset_fetch_response(
     request: OffsetFetchRequest,
     groups: &GroupCoordinator,
+    engine: &LogEngine,
 ) -> OffsetFetchResponse {
     let group = request.group_id.0.as_str().to_owned();
     let requested_topics = request.topics;
@@ -733,12 +779,21 @@ async fn offset_fetch_response(
             for topic in &topics {
                 for partition in &topic.partition_indexes {
                     let key = TopicPartition::new(topic.name.0.as_str(), *partition);
-                    match groups.validate_topic_partition(&key) {
-                        Ok(()) => {
+                    let validation = groups.validate_topic_partition(&key);
+                    let error_code = match validation {
+                        Ok(()) => match engine.topic_exists(&key.topic, key.partition).await {
+                            Ok(true) => None,
+                            Ok(false) => Some(ResponseError::UnknownTopicOrPartition.code()),
+                            Err(error) => Some(log_error_code(&error)),
+                        },
+                        Err(error) => Some(error.response_error().code()),
+                    };
+                    match error_code {
+                        None => {
                             selection.insert(key);
                         }
-                        Err(error) => {
-                            local_errors.insert(key, error.response_error().code());
+                        Some(error_code) => {
+                            local_errors.insert(key, error_code);
                         }
                     }
                 }
@@ -834,7 +889,8 @@ fn log_error_code(error: &LogError) -> i16 {
         LogError::BatchTooLarge { .. } | LogError::TooManyRecords { .. } => {
             ResponseError::MessageTooLarge.code()
         }
-        LogError::InvalidManifest { .. }
+        LogError::InvalidTopicMetadata { .. }
+        | LogError::InvalidManifest { .. }
         | LogError::MissingSegment { .. }
         | LogError::CorruptSegment { .. }
         | LogError::Codec { .. } => ResponseError::CorruptMessage.code(),
@@ -1474,6 +1530,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_partition_metadata_advertises_every_durable_partition() {
+        let engine =
+            LogEngine::in_memory_with_partitions("walstream/clusters/multi-partition-metadata", 3)
+                .unwrap();
+        let identity = BrokerIdentity {
+            host: "localhost".into(),
+            port: 9092,
+            cluster_id: "multi-partition-metadata".into(),
+        };
+        let request = MetadataRequest::default()
+            .with_topics(Some(vec![
+                MetadataRequestTopic::default().with_name(Some(topic_name("events".into()))),
+            ]))
+            .with_allow_auto_topic_creation(true);
+
+        let response = metadata_response(request, 4, &engine, &identity)
+            .await
+            .unwrap();
+        assert_eq!(response.topics.len(), 1);
+        assert_eq!(response.topics[0].error_code, 0);
+        assert_eq!(
+            response.topics[0]
+                .partitions
+                .iter()
+                .map(|partition| partition.partition_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let response = produce_response(produce_request(2), &engine).await;
+        assert_eq!(response.responses[0].partition_responses[0].error_code, 0);
+        let response = produce_response(produce_request(3), &engine).await;
+        assert_eq!(
+            response.responses[0].partition_responses[0].error_code,
+            ResponseError::UnknownTopicOrPartition.code()
+        );
+    }
+
+    #[tokio::test]
     async fn produce_canonicalizes_multiple_input_batches_to_one_segment_batch() {
         let engine = LogEngine::in_memory("walstream/clusters/one-batch").unwrap();
         let first = record();
@@ -1953,10 +2048,90 @@ mod tests {
         let ResponseKind::OffsetCommit(response) = response else {
             panic!("unexpected response kind")
         };
-        assert!(response.topics[0].partitions.iter().all(|partition| {
-            partition.error_code == ResponseError::UnknownTopicOrPartition.code()
-        }));
-        assert!(groups.fetch("workers", None).await.unwrap().is_empty());
+        assert_eq!(response.topics[0].partitions[0].error_code, 0);
+        assert_eq!(
+            response.topics[0].partitions[1].error_code,
+            ResponseError::UnknownTopicOrPartition.code()
+        );
+        let committed = groups.fetch("workers", None).await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(
+            committed[0].topic_partition,
+            TopicPartition::new("events", 0)
+        );
+        assert_eq!(committed[0].committed.as_ref().unwrap().offset, 4);
+
+        let stale_commit = OffsetCommitRequest::default()
+            .with_group_id(GroupId(StrBytes::from_static_str("workers")))
+            .with_generation_id_or_member_epoch(2)
+            .with_member_id(StrBytes::from_string(member_id.clone()))
+            .with_retention_time_ms(-1)
+            .with_topics(vec![
+                OffsetCommitRequestTopic::default()
+                    .with_name(topic_name("events".into()))
+                    .with_partitions(vec![
+                        OffsetCommitRequestPartition::default()
+                            .with_partition_index(0)
+                            .with_committed_offset(5),
+                        OffsetCommitRequestPartition::default()
+                            .with_partition_index(1)
+                            .with_committed_offset(3),
+                    ]),
+            ]);
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::OffsetCommit,
+            2,
+            RequestKind::OffsetCommit(stale_commit),
+        )
+        .await;
+        let ResponseKind::OffsetCommit(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert!(
+            response.topics[0].partitions.iter().all(|partition| {
+                partition.error_code == ResponseError::IllegalGeneration.code()
+            })
+        );
+        assert_eq!(
+            groups.fetch("workers", None).await.unwrap()[0]
+                .committed
+                .as_ref()
+                .unwrap()
+                .offset,
+            4
+        );
+
+        let invalid_group_commit = OffsetCommitRequest::default()
+            .with_group_id(GroupId(StrBytes::from_static_str("../workers")))
+            .with_generation_id_or_member_epoch(1)
+            .with_member_id(StrBytes::from_string(member_id.clone()))
+            .with_retention_time_ms(-1)
+            .with_topics(vec![
+                OffsetCommitRequestTopic::default()
+                    .with_name(topic_name("events".into()))
+                    .with_partitions(vec![
+                        OffsetCommitRequestPartition::default()
+                            .with_partition_index(1)
+                            .with_committed_offset(3),
+                    ]),
+            ]);
+        let (_, response) = wire_round_trip_with_groups(
+            &engine,
+            &groups,
+            ApiKey::OffsetCommit,
+            2,
+            RequestKind::OffsetCommit(invalid_group_commit),
+        )
+        .await;
+        let ResponseKind::OffsetCommit(response) = response else {
+            panic!("unexpected response kind")
+        };
+        assert_eq!(
+            response.topics[0].partitions[0].error_code,
+            ResponseError::InvalidGroupId.code()
+        );
 
         let negative_commit = OffsetCommitRequest::default()
             .with_group_id(GroupId(StrBytes::from_static_str("workers")))
@@ -2101,6 +2276,15 @@ mod tests {
     #[tokio::test]
     async fn offset_protocol_preserves_null_metadata_and_localizes_fetch_errors() {
         let store = Arc::new(InMemory::new());
+        let engine = LogEngine::with_default_topic_partitions(
+            store.clone(),
+            "walstream/clusters/offset-semantics",
+            3,
+        )
+        .unwrap();
+        for topic in ["events", "none", "empty", "absent"] {
+            engine.ensure_topic(topic, 0).await.unwrap();
+        }
         let groups = GroupCoordinator::new(
             GroupStore::new(store.clone(), "walstream/clusters/offset-semantics").unwrap(),
         );
@@ -2144,6 +2328,10 @@ mod tests {
                                 .with_partition_index(0)
                                 .with_committed_offset(4)
                                 .with_committed_metadata(Some(StrBytes::from_static_str("done"))),
+                            OffsetCommitRequestPartition::default()
+                                .with_partition_index(2)
+                                .with_committed_offset(8)
+                                .with_committed_metadata(Some(StrBytes::from_static_str("p2"))),
                         ]),
                     OffsetCommitRequestTopic::default()
                         .with_name(topic_name("none".into()))
@@ -2164,7 +2352,7 @@ mod tests {
                 ])
         };
 
-        let rejected = offset_commit_response(commit_request(60_000), &groups).await;
+        let rejected = offset_commit_response(commit_request(60_000), &groups, &engine).await;
         assert!(rejected.topics.iter().all(|topic| {
             topic
                 .partitions
@@ -2173,7 +2361,7 @@ mod tests {
         }));
         assert!(groups.fetch("workers", None).await.unwrap().is_empty());
 
-        let committed = offset_commit_response(commit_request(-1), &groups).await;
+        let committed = offset_commit_response(commit_request(-1), &groups, &engine).await;
         assert!(committed.topics.iter().all(|topic| {
             topic
                 .partitions
@@ -2187,7 +2375,7 @@ mod tests {
                 .with_topics(Some(vec![
                     OffsetFetchRequestTopic::default()
                         .with_name(topic_name("events".into()))
-                        .with_partition_indexes(vec![0, 1]),
+                        .with_partition_indexes(vec![0, 1, 2, 3]),
                     OffsetFetchRequestTopic::default()
                         .with_name(topic_name("none".into()))
                         .with_partition_indexes(vec![0]),
@@ -2199,6 +2387,7 @@ mod tests {
                         .with_partition_indexes(vec![0]),
                 ])),
             &groups,
+            &engine,
         )
         .await;
         assert_eq!(fetched.error_code, 0);
@@ -2211,8 +2400,19 @@ mod tests {
                 .as_str(),
             "done"
         );
+        assert_eq!(fetched.topics[0].partitions[1].error_code, 0);
+        assert_eq!(fetched.topics[0].partitions[1].committed_offset, -1);
+        assert_eq!(fetched.topics[0].partitions[2].committed_offset, 8);
         assert_eq!(
-            fetched.topics[0].partitions[1].error_code,
+            fetched.topics[0].partitions[2]
+                .metadata
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "p2"
+        );
+        assert_eq!(
+            fetched.topics[0].partitions[3].error_code,
             ResponseError::UnknownTopicOrPartition.code()
         );
         assert_eq!(fetched.topics[1].partitions[0].committed_offset, 5);
@@ -2238,6 +2438,7 @@ mod tests {
                         .with_partition_indexes(vec![0]),
                 ])),
             &groups,
+            &engine,
         )
         .await;
         assert_eq!(
@@ -2261,6 +2462,7 @@ mod tests {
                         .with_partition_indexes(vec![0]),
                 ])),
             &groups,
+            &engine,
         )
         .await;
         assert_eq!(

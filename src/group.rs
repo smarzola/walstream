@@ -16,6 +16,8 @@ use serde::{
 };
 use thiserror::Error;
 
+use crate::log::MAX_TOPIC_PARTITIONS;
+
 const OFFSET_SCHEMA: u32 = 1;
 const MAX_CAS_ATTEMPTS: usize = 128;
 const MAX_OFFSET_MANIFEST_BYTES: usize = 1024 * 1024;
@@ -489,7 +491,8 @@ fn validate_component(value: &str, kind: IdentifierKind) -> Result<(), GroupErro
 }
 
 fn validate_partition(partition: i32) -> Result<(), GroupError> {
-    (partition == 0)
+    (0..MAX_TOPIC_PARTITIONS)
+        .contains(&partition)
         .then_some(())
         .ok_or(GroupError::UnsupportedPartition { partition })
 }
@@ -518,7 +521,7 @@ pub enum GroupError {
     InvalidGroupId { group: String },
     #[error("invalid topic name {topic:?}")]
     InvalidTopic { topic: String },
-    #[error("partition {partition} is unsupported; Walstream supports partition 0 only")]
+    #[error("partition {partition} is outside Walstream's supported range")]
     UnsupportedPartition { partition: i32 },
     #[error("committed offset {offset} must not be negative")]
     InvalidOffset { offset: i64 },
@@ -688,6 +691,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_partition_offsets_are_durable_and_independent() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first = GroupStore::new(store.clone(), "walstream/clusters/partition-offsets").unwrap();
+        first
+            .commit(
+                "workers",
+                &[
+                    OffsetCommit {
+                        partition: 0,
+                        ..commit("events", 4)
+                    },
+                    OffsetCommit {
+                        partition: 2,
+                        ..commit("events", 9)
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let recovered = GroupStore::new(store, "walstream/clusters/partition-offsets").unwrap();
+        let offsets = recovered.offsets("workers").await.unwrap();
+        assert_eq!(offsets[&TopicPartition::new("events", 0)].offset, 4);
+        assert_eq!(offsets[&TopicPartition::new("events", 2)].offset, 9);
+    }
+
+    #[tokio::test]
     async fn concurrent_commits_preserve_non_conflicting_offsets() {
         let store = Arc::new(ContentionStore::new());
         let left = GroupStore::new(store.clone(), "walstream/clusters/concurrent").unwrap();
@@ -751,7 +781,8 @@ mod tests {
 
         for invalid in [
             vec![TopicPartition::new("bad/topic", 0)],
-            vec![TopicPartition::new("events", 1)],
+            vec![TopicPartition::new("events", -1)],
+            vec![TopicPartition::new("events", MAX_TOPIC_PARTITIONS)],
             vec![
                 TopicPartition::new("events", 0),
                 TopicPartition::new("events", 0),
@@ -769,7 +800,7 @@ mod tests {
         for commits in [
             vec![commit("events", -1)],
             vec![OffsetCommit {
-                partition: 1,
+                partition: MAX_TOPIC_PARTITIONS,
                 ..commit("events", 1)
             }],
             vec![commit("events/escape", 1)],
@@ -808,7 +839,9 @@ mod tests {
             Bytes::from_static(br#"{"schema":1"#),
             Bytes::from_static(br#"{"schema":1,"revision":1,"offsets":[{"topic":"events","partition":0,"offset":1,"metadata":null},{"topic":"events","partition":0,"offset":2,"metadata":null}]}"#),
             Bytes::from_static(br#"{"schema":1,"revision":0,"offsets":[{"topic":"../events","partition":0,"offset":1,"metadata":null}]}"#),
-            Bytes::from_static(br#"{"schema":1,"revision":0,"offsets":[{"topic":"events","partition":1,"offset":1,"metadata":null}]}"#),
+            Bytes::from(format!(
+                "{{\"schema\":1,\"revision\":0,\"offsets\":[{{\"topic\":\"events\",\"partition\":{MAX_TOPIC_PARTITIONS},\"offset\":1,\"metadata\":null}}]}}"
+            )),
             Bytes::from_static(br#"{"schema":1,"revision":0,"offsets":[{"topic":"events","partition":0,"offset":-1,"metadata":null}]}"#),
             Bytes::from(format!(
                 "{{\"schema\":1,\"revision\":0,\"offsets\":[{{\"topic\":\"events\",\"partition\":0,\"offset\":1,\"metadata\":\"{}\"}}]}}",
