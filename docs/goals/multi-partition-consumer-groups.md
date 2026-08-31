@@ -76,7 +76,7 @@ The goal is complete only when:
 
 - [x] Milestone 1: Durable multi-partition topics and partition-aware data APIs
 - [x] Milestone 2: Bounded multi-member classic group coordination
-- [ ] Milestone 3: Real-client rebalance/recovery proof and operator documentation
+- [x] Milestone 3: Real-client rebalance/recovery proof and operator documentation
 
 ### Checkpoint Protocol
 
@@ -182,7 +182,7 @@ WALSTREAM_E2E_BACKEND=seaweedfs ./scripts/test-s3-e2e.sh
 WALSTREAM_E2E_BACKEND=minio ./scripts/test-s3-e2e.sh
 ```
 
-Status: Not started.
+Status: Complete on 2026-09-01. Pinned librdkafka 2.12.1 and Kafka Java 4.2.0 each proved a disjoint complete three-partition split across two dynamic members, exact all-partition survivor takeover after one member left, and retained-client recovery with a changed member identity after complete broker replacement. A strict one-member seed phase makes missing or stale replacement offsets fail; each measured survivor resumed every partition at exact offset 2 and committed next offset 3 without replay. README, architecture, and environment documentation now cover partition creation, durable layout, classic-group phases, bounds, failure semantics, proof scope, and current non-goals. Verification: `sh -n scripts/test-consumer-group-clients.sh scripts/test-s3-e2e.sh` (passed), `container system status` (running), `./scripts/test-consumer-group-clients.sh` (both pinned clients passed), and RustFS, SeaweedFS, and MinIO variants of `./scripts/test-s3-e2e.sh` (1 live test passed on each backend). The regression gate also passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets` (63 library, 1 binary, 3 protocol, and 2 stock-client tests passed; 1 script-gated live test ignored). Adversarial review required one repair round to eliminate an offset-reset false positive; the hardened proof passed live and the reviewer reported no blocking findings.
 
 ## Final Verification
 
@@ -209,6 +209,7 @@ Inspect every failure. Fix in-scope regressions rather than weakening tests. Doc
 - 2026-09-01: Topic metadata is the durable topic-existence record. A valid partition without a manifest is an empty log; manifests remain lazy so creating a 1024-partition topic does not require 1024 object writes.
 - 2026-09-01: Validate records and the prospective partition range before topic metadata creation so rejected Produce requests remain side-effect free.
 - 2026-09-01: Coordinate each classic group through bounded Joining, AwaitingSync, and Stable phases. The elected leader chooses the first protocol common to every member, receives selected-protocol metadata for all members, and atomically installs exactly one opaque assignment per member.
+- 2026-09-01: Real-client probes create all three logs with seed records and use a one-member seed phase to initialize durable group offsets. The measured two-member phase disables offset reset, commits the next generation on every partition, and requires the retained survivor to resume at exactly the committed next offsets after replacement. Missing replacement offsets therefore fail instead of aliasing the current log end.
 
 ## Resume Protocol
 
