@@ -64,6 +64,7 @@ wait_for_phase() {
         if ! kill -0 "$pid" >/dev/null 2>&1; then
             wait "$pid" 2>/dev/null || true
             cat "$log" >&2
+            cat "$tmp_dir/broker-$broker_run.log" >&2 || true
             echo "$name exited before $phase" >&2
             exit 1
         fi
@@ -96,6 +97,7 @@ start_broker() {
         --allow-http \
         --prefix "$prefix" \
         --cluster-id "$cluster" \
+        --default-topic-partitions 3 \
         --listen "0.0.0.0:$broker_port" \
         --advertised-host "$host_gateway" \
         --advertised-port "$broker_port" \
@@ -201,9 +203,13 @@ container exec "$java_name" mvn -q -f /work/pom.xml exec:java \
 java_pid=$!
 
 wait_for_phase "$tmp_dir/librdkafka.ready" "$librdkafka_pid" \
-    "$tmp_dir/librdkafka.log" librdkafka "commit its first offset"
+    "$tmp_dir/librdkafka.log" librdkafka "split and commit all three partitions"
 wait_for_phase "$tmp_dir/java.ready" "$java_pid" "$tmp_dir/java.log" \
-    java "commit its first offset"
+    java "split and commit all three partitions"
+wait_for_phase "$tmp_dir/librdkafka.survivor" "$librdkafka_pid" \
+    "$tmp_dir/librdkafka.log" librdkafka "reassign all partitions to its survivor"
+wait_for_phase "$tmp_dir/java.survivor" "$java_pid" "$tmp_dir/java.log" \
+    java "reassign all partitions to its survivor"
 
 stop_broker
 sleep 2
@@ -246,4 +252,4 @@ fi
 java_pid=
 cat "$tmp_dir/java.log"
 
-echo "pinned librdkafka 2.12.1 and Apache Kafka Java 4.2.0 resumed after broker replacement"
+echo "pinned librdkafka 2.12.1 and Apache Kafka Java 4.2.0 proved two-member three-partition rebalancing and retained-survivor recovery"
