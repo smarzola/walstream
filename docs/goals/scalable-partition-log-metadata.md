@@ -167,3 +167,7 @@ Goal status: **achieved on 2026-09-06**. All nine success criteria, milestone ch
 Delivery commits before this final status note: `276b217` (approved goal), `fd5bfb3` (bounded index implementation and focused proofs), and `a7e9426` (final runtime/regression evidence and group-capacity test fixture repair).
 
 Completion requires all success criteria, the automated gate, both runtime records, no material blocking final-review findings, and understood git state. Report behavior, commit(s), concise verification, each role's runtime results, review disposition, and remaining authorized work or blockers.
+
+## Subsequent Delivery Authorization
+
+- 2026-09-06: After local completion and independent review, the user instructed: “Pr it and when green merge”. This authorizes pushing this branch, opening the pull request, waiting for green CI on its exact head, and merging it. The implementation and verification scope is unchanged.
