@@ -87,7 +87,7 @@ Planned implementation branch: `feat/scalable-partition-log-metadata`.
 
 - [x] Milestone 1: integrated bounded index and schema-v1 compatibility; focused log/protocol/stock-client checks and initial runtime use pass.
 - [x] Milestone 2: growth, targeted lookup, migration ceiling, concurrency, and failure criteria pass; record observed page bounds and metadata operation evidence.
-- [ ] Milestone 3: real-broker scenarios, relevant full regressions, and documentation pass.
+- [x] Milestone 3: real-broker scenarios, relevant full regressions, and documentation pass.
 
 After a coherent milestone passes its checks and applicable runtime acceptance, record evidence and decisions here and commit it with a focused Conventional Commit. Record the hash in a later note/report. Final independent review and both runtime records remain separate completion gates.
 
@@ -139,8 +139,17 @@ The planned runtime helper may provision data and drive requests, but running a 
 
 Use deterministic storage-boundary fault tests for exact commit interleavings; a process kill without evidence of its timing is not proof of a particular pre/post-CAS boundary. The retained Java/librdkafka group workflow remains a separate required regression.
 
-Implementer runtime record: pending.
+Implementer runtime record: passed on 2026-09-06. Ran `./scripts/test-log-index.sh --baseline-broker /tmp/walstream-index-baseline-src/target/release/walstream` against the release build of implementation commit `fd5bfb3`. The concurrent working diff changed only the group-capacity test fixture and subsequent documentation; executable behavior was unchanged. The script created owned RustFS container `walstream-index-1788645651-68693` and prefix `walkthrough-1788645651-68693/clusters/index`, launched actual brokers (PIDs 68936, 69426, 69442, 69445, 69446), sent separate Kafka Produce/Fetch requests, and inspected S3 objects. All 25,000 appends and exact full readbacks passed before and after process replacement; root size was 10,550 bytes, tree level 2, and its page 2,038 bytes. Appending after replacement returned offset 25,000. The v1 fixture stayed v1 on read, converted on append, preserved original record bytes, and survived another replacement. An actual baseline executable built from `3f881b3` (PID 69443) rejected the upgraded partition. The proxy intercepted a root PUT after record/index objects were uploaded but before upstream publication; the broker was killed, and a fresh process recovered offset 64 and appended there. Corrupt referenced metadata returned a Kafka Fetch error. The helper cleaned up its owned resources. Raw output: `/tmp/walstream-index-full.log`.
 Reviewer runtime record: pending.
+
+## Final Regression Evidence
+
+- Implementation checkpoint: `fd5bfb3` (`feat: index partition logs with bounded immutable pages`).
+- `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets`, and shell syntax checks passed. Counts: 69 library, 1 binary, 3 protocol, and 2 stock-client tests; the script-gated S3 test is ignored only in the hermetic suite. Raw output: `/tmp/walstream-final-checks-2.log`.
+- The initial full suite failed the unchanged `bounds_and_reclaims_group_slots` fixture: filling 10,000 slots exceeded its 30-second session duration under concurrent load, so early slots expired (7,023 retained after a 32.82-second run). The fixture now uses the existing 300-second maximum for its population phase; every capacity, rejection, leave, and reclamation assertion is preserved, and production coordinator code is unchanged. The rerun passed. Original output: `/tmp/walstream-final-checks.log`.
+- `./scripts/test-consumer-group-clients.sh`: both pinned librdkafka 2.12.1 and Kafka Java 4.2.0 passed the three-partition/two-member split, survivor reassignment, retained-client replacement, and exact offset resume. Raw output: `/tmp/walstream-client-recovery.log`.
+- `WALSTREAM_E2E_BACKEND={rustfs,seaweedfs,minio} ./scripts/test-s3-e2e.sh`: each passed the live binary test, now including two leaf rollovers, exact indexed-history readback, and a further replacement process. Raw outputs: `/tmp/walstream-s3-rustfs.log`, `/tmp/walstream-s3-seaweedfs.log`, `/tmp/walstream-s3-minio.log`.
+- Final independent review and reviewer-owned runtime acceptance remain separate pending completion conditions.
 
 ## Decision And Status Notes
 

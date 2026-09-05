@@ -1968,8 +1968,8 @@ mod tests {
             groups
                 .join(
                     "unknown",
-                    30_000,
-                    30_000,
+                    MAX_SESSION_TIMEOUT_MS,
+                    MAX_SESSION_TIMEOUT_MS,
                     "member",
                     "consumer",
                     &protocols(),
@@ -1981,13 +1981,15 @@ mod tests {
         );
         assert!(groups.groups.lock().await.is_empty());
 
+        // Keep the fixture alive while populating all slots on loaded hosts.
+        // The capacity assertions require every member to remain active.
         let mut first_member = None;
         for index in 0..MAX_GROUP_SLOTS {
             let joined = groups
                 .join(
                     &format!("group-{index}"),
-                    30_000,
-                    30_000,
+                    MAX_SESSION_TIMEOUT_MS,
+                    MAX_SESSION_TIMEOUT_MS,
                     "",
                     "consumer",
                     &protocols(),
@@ -2001,7 +2003,14 @@ mod tests {
         assert_eq!(groups.groups.lock().await.len(), MAX_GROUP_SLOTS);
         assert_eq!(
             groups
-                .join("one-too-many", 30_000, 30_000, "", "consumer", &protocols(),)
+                .join(
+                    "one-too-many",
+                    MAX_SESSION_TIMEOUT_MS,
+                    MAX_SESSION_TIMEOUT_MS,
+                    "",
+                    "consumer",
+                    &protocols(),
+                )
                 .await
                 .unwrap_err()
                 .response_error(),
@@ -2015,7 +2024,14 @@ mod tests {
             .unwrap();
         assert_eq!(groups.groups.lock().await.len(), MAX_GROUP_SLOTS - 1);
         groups
-            .join("replacement", 30_000, 30_000, "", "consumer", &protocols())
+            .join(
+                "replacement",
+                MAX_SESSION_TIMEOUT_MS,
+                MAX_SESSION_TIMEOUT_MS,
+                "",
+                "consumer",
+                &protocols(),
+            )
             .await
             .unwrap();
         assert_eq!(groups.groups.lock().await.len(), MAX_GROUP_SLOTS);

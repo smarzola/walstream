@@ -10,7 +10,7 @@ Sealed index leaves contain exactly 64 ordered descriptors. Branches contain 1â€
 
 New topics persist their creation-time partition count in `<prefix>/clusters/<cluster-id>/topics/<topic>/metadata.json`. The operator default is bounded to `1..=1024`, and a later setting change cannot reinterpret an existing topic. A valid legacy partition-0 manifest without metadata is inferred and upgraded as a one-partition topic without log rewrite. Partition manifests and segment namespaces are otherwise independent.
 
-For every append, a writer reads the manifest and its ETag, assigns the next contiguous offsets, canonicalizes the accepted records into one uncompressed Kafka v2 record batch, and creates an immutable UUID-named object. It then either conditionally creates the first manifest or updates the existing manifest with `If-Match` semantics.
+For every append, a writer reads the manifest and its ETag, assigns the next contiguous offsets, canonicalizes the accepted records into one uncompressed Kafka v2 record batch, creates any required immutable index pages, and writes the UUID-named record object. It then either conditionally creates the first manifest or updates the existing manifest with `If-Match` semantics.
 
 The manifest write is the only commit point. A precondition failure means another writer committed first; the losing segment is an invisible orphan and the writer retries from the new manifest. An acknowledged append therefore has a unique contiguous range, while failed or crashed attempts cannot become visible without a committed manifest reference.
 
@@ -18,8 +18,8 @@ The manifest write is the only commit point. A precondition failure means anothe
 
 | Failure point | Result |
 | --- | --- |
-| Before segment create | No durable change |
-| After segment create, before manifest CAS | Invisible orphan; never fetched |
+| Before any object create | No durable change |
+| After record/index object create, before manifest CAS | Invisible orphan; never fetched |
 | Manifest CAS precondition failure | Invisible orphan; retry from current ETag |
 | After successful manifest CAS, before response | Data is committed; client may retry because the MVP has no idempotent producer support |
 | After acknowledgement | A fresh process reconstructs the log from the bucket |

@@ -70,10 +70,11 @@ The default maximum request frame is 16 MiB. Before generated decoding, an alloc
 An append:
 
 1. reads the committed partition manifest;
-2. assigns contiguous offsets and writes one immutable record-batch object;
+2. assigns contiguous offsets and encodes the new record batch;
 3. seals a full 64-segment tail into immutable index pages when necessary;
-4. publishes the bounded index root by conditionally creating or ETag-updating the manifest;
-5. retries from fresh state if another writer wins the manifest race.
+4. writes the immutable record-batch object;
+5. publishes the bounded index root by conditionally creating or ETag-updating the manifest;
+6. retries from fresh state if another writer wins the manifest race.
 
 Only the manifest CAS is the commit point. A crash before it can leave an invisible orphan object; a crash after an acknowledged CAS leaves all required state in the bucket. Reads validate manifest invariants, object length, SHA-256, Kafka CRC and raw allocation bounds, logical offsets, unsupported semantics, and exact canonical re-encoding.
 
