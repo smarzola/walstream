@@ -4,7 +4,7 @@ Repository: `/Users/smarzola/projects/walstream`
 Source of truth: this contract and the 2026-09-05 conversation recommending scalable log metadata as the next implementation milestone.
 Revision: 1, prepared 2026-09-05.
 Approval: **Approved** revision 1 on 2026-09-05. The user replied “Approved” to the revision-1 presentation, including automatic migration on the first successful append and the old-binary downgrade boundary.
-Execution: approved local implementation, verification, runtime acceptance, independent review, and focused commits in progress.
+Execution: approved local implementation, verification, both runtime walkthroughs, independent review, and focused commits completed on 2026-09-06.
 
 ## Outcome And Delivery Plan
 
@@ -140,7 +140,7 @@ The planned runtime helper may provision data and drive requests, but running a 
 Use deterministic storage-boundary fault tests for exact commit interleavings; a process kill without evidence of its timing is not proof of a particular pre/post-CAS boundary. The retained Java/librdkafka group workflow remains a separate required regression.
 
 Implementer runtime record: passed on 2026-09-06. Ran `./scripts/test-log-index.sh --baseline-broker /tmp/walstream-index-baseline-src/target/release/walstream` against the release build of implementation commit `fd5bfb3`. The concurrent working diff changed only the group-capacity test fixture and subsequent documentation; executable behavior was unchanged. The script created owned RustFS container `walstream-index-1788645651-68693` and prefix `walkthrough-1788645651-68693/clusters/index`, launched actual brokers (PIDs 68936, 69426, 69442, 69445, 69446), sent separate Kafka Produce/Fetch requests, and inspected S3 objects. All 25,000 appends and exact full readbacks passed before and after process replacement; root size was 10,550 bytes, tree level 2, and its page 2,038 bytes. Appending after replacement returned offset 25,000. The v1 fixture stayed v1 on read, converted on append, preserved original record bytes, and survived another replacement. An actual baseline executable built from `3f881b3` (PID 69443) rejected the upgraded partition. The proxy intercepted a root PUT after record/index objects were uploaded but before upstream publication; the broker was killed, and a fresh process recovered offset 64 and appended there. Corrupt referenced metadata returned a Kafka Fetch error. The helper cleaned up its owned resources. Raw output: `/tmp/walstream-index-full.log`.
-Reviewer runtime record: pending.
+Reviewer runtime record: passed independently on 2026-09-06 at `a7e94262597dcf8fb1dde8f577f30779d6ba89eb`. Fresh Sol reviewer invoked `script -q /tmp/walstream-review-runtime.log ./scripts/test-log-index.sh --baseline-broker /tmp/walstream-index-baseline-src/target/release/walstream`, built release code, and launched actual brokers (PIDs 70139, 70412, 70415, 70418, 70419) against its own RustFS container `walstream-index-1788645971-70006`. It observed 25,000 separate acknowledged appends, exact full readback, root 10,550 bytes/tree level 2/page 2,038 bytes, replacement recovery and next offset 25,000, unchanged v1 reads followed by migration preserving record objects and replacement readback, actual old-binary rejection, pre-publication interception followed by hard process loss and offset-64 recovery, and a Kafka Fetch error for corrupt referenced metadata. The reviewer independently compared the baseline source byte-for-byte with a git archive of base `3f881b3`. Runtime exited 0; owned containers and broker/proxy processes were gone afterward. It also ran `cargo test --lib log::` (24 passed in 12.23 seconds), recording `/tmp/walstream-review-focused-tests.log`. Git remained clean at the exact reviewed head.
 
 ## Final Regression Evidence
 
@@ -149,7 +149,7 @@ Reviewer runtime record: pending.
 - The initial full suite failed the unchanged `bounds_and_reclaims_group_slots` fixture: filling 10,000 slots exceeded its 30-second session duration under concurrent load, so early slots expired (7,023 retained after a 32.82-second run). The fixture now uses the existing 300-second maximum for its population phase; every capacity, rejection, leave, and reclamation assertion is preserved, and production coordinator code is unchanged. The rerun passed. Original output: `/tmp/walstream-final-checks.log`.
 - `./scripts/test-consumer-group-clients.sh`: both pinned librdkafka 2.12.1 and Kafka Java 4.2.0 passed the three-partition/two-member split, survivor reassignment, retained-client replacement, and exact offset resume. Raw output: `/tmp/walstream-client-recovery.log`.
 - `WALSTREAM_E2E_BACKEND={rustfs,seaweedfs,minio} ./scripts/test-s3-e2e.sh`: each passed the live binary test, now including two leaf rollovers, exact indexed-history readback, and a further replacement process. Raw outputs: `/tmp/walstream-s3-rustfs.log`, `/tmp/walstream-s3-seaweedfs.log`, `/tmp/walstream-s3-minio.log`.
-- Final independent review and reviewer-owned runtime acceptance remain separate pending completion conditions.
+- Final independent review and reviewer-owned runtime acceptance both passed; see their separate records.
 
 ## Decision And Status Notes
 
@@ -161,7 +161,9 @@ Reviewer runtime record: pending.
 
 On resume, read this goal, actual approval/decision evidence, applicable instructions, git state, and relevant commits. Continue unfinished work without repeating valid checkpoints or silently weakening criteria.
 
-Final independent review: pending.
-Goal status: in progress; revision 1 approved.
+Final independent review: passed on 2026-09-06. One fresh Sol (`gpt-5.6-sol`) reviewer inspected the entire base `3f881b3` through head `a7e9426` diff, affected execution paths, tests, documentation, and raw evidence. Verdict: **no material blocking findings**. Correctness, completeness, simplicity, and test quality were assessed together; no material unnecessary complexity or ineffective tests were found. No review repair round was required. The only subsequent change is this completion/evidence record, so executable and runtime evidence remain valid.
+Goal status: **achieved on 2026-09-06**. All nine success criteria, milestone checks, regression checks, and both independent runtime records are satisfied. The implementation remains on `feat/scalable-partition-log-metadata`; external publication was not authorized.
+
+Delivery commits before this final status note: `276b217` (approved goal), `fd5bfb3` (bounded index implementation and focused proofs), and `a7e9426` (final runtime/regression evidence and group-capacity test fixture repair).
 
 Completion requires all success criteria, the automated gate, both runtime records, no material blocking final-review findings, and understood git state. Report behavior, commit(s), concise verification, each role's runtime results, review disposition, and remaining authorized work or blockers.
