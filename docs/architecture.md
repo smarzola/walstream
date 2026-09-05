@@ -4,11 +4,13 @@ Walstream maps each Kafka topic to schema-versioned metadata plus one independen
 
 ## Commit protocol
 
-Each partition has one JSON manifest containing a revision, the next exclusive offset, and an ordered list of immutable segment descriptors. A descriptor fixes the object path, base offset, record count, encoded byte length, and SHA-256 digest.
+Each partition has one schema-2 JSON manifest containing a revision (the committed segment count), the next exclusive offset, at most 64 active segment descriptors, and an optional immutable index-tree reference. A segment descriptor fixes the object path, base offset, record count, encoded byte length, and SHA-256 digest.
+
+Sealed index leaves contain exactly 64 ordered descriptors. Branches contain 1–64 child references with contiguous offset ranges, equal child levels, segment counts, lengths, and SHA-256 digests. Every subtree except the rightmost is full. Pages live under the partition's `index/<uuid>.json` namespace. When a full active tail rolls over, a writer creates its immutable leaf and replaces only the rightmost branch path, growing a new tree level when necessary. Ordinary appends update only the root; ListOffsets reads the root; Fetch seeks through offset ranges and stops when its response budget is exhausted. Reads take their snapshot from one root and its immutable descendants, without listing objects or consulting local recovery state.
 
 New topics persist their creation-time partition count in `<prefix>/clusters/<cluster-id>/topics/<topic>/metadata.json`. The operator default is bounded to `1..=1024`, and a later setting change cannot reinterpret an existing topic. A valid legacy partition-0 manifest without metadata is inferred and upgraded as a one-partition topic without log rewrite. Partition manifests and segment namespaces are otherwise independent.
 
-For every append, a writer reads the manifest and its ETag, assigns the next contiguous offsets, canonicalizes the accepted records into one uncompressed Kafka v2 record batch, and creates an immutable UUID-named object. It then either conditionally creates the first manifest or updates the existing manifest with `If-Match` semantics.
+For every append, a writer reads the manifest and its ETag, assigns the next contiguous offsets, canonicalizes the accepted records into one uncompressed Kafka v2 record batch, creates any required immutable index pages, and writes the UUID-named record object. It then either conditionally creates the first manifest or updates the existing manifest with `If-Match` semantics.
 
 The manifest write is the only commit point. A precondition failure means another writer committed first; the losing segment is an invisible orphan and the writer retries from the new manifest. An acknowledged append therefore has a unique contiguous range, while failed or crashed attempts cannot become visible without a committed manifest reference.
 
@@ -16,13 +18,19 @@ The manifest write is the only commit point. A precondition failure means anothe
 
 | Failure point | Result |
 | --- | --- |
-| Before segment create | No durable change |
-| After segment create, before manifest CAS | Invisible orphan; never fetched |
+| Before any object create | No durable change |
+| After record/index object create, before manifest CAS | Invisible orphan; never fetched |
 | Manifest CAS precondition failure | Invisible orphan; retry from current ETag |
 | After successful manifest CAS, before response | Data is committed; client may retry because the MVP has no idempotent producer support |
 | After acknowledgement | A fresh process reconstructs the log from the bucket |
 
-Walstream does not yet collect orphan segments. They cost storage but cannot change the readable log.
+Walstream does not yet collect orphan segments, unpublished index pages, or superseded immutable branch pages. They cost storage but cannot change the readable log. Successful rollovers and migrations can also leave superseded pages. No deletion or retention policy is implemented.
+
+## Durable-format upgrade
+
+The reader accepts schema-1 flat manifests and schema-2 index roots. A schema-1 manifest is fully bounded and validated with the existing 10,000-descriptor/4 MiB read limits. On its next append, the writer builds an index referencing the original record objects, adds the new batch, and publishes schema 2 with one CAS against the exact schema-1 ETag. Losing that race reloads current state and retries, including when another writer completed the migration. A crash before publication leaves the legacy manifest authoritative; a successful publication makes the complete indexed history recoverable.
+
+Reads do not convert partition manifests, and original record objects and offsets are unchanged. Older binaries reject schema 2. Operators must stop old processes before adopting the new writer; mixed-version operation and downgrade after conversion are unsupported. Legacy topic-metadata inference and durable consumer-offset objects keep their existing behavior.
 
 ## Consumer-group state
 
@@ -36,7 +44,9 @@ A broker replacement therefore preserves every partition's next committed offset
 
 ## Read path and bounds
 
-Manifest bodies are streamed under a 4 MiB cap, and their sequence deserializer stops at 10,000 segments before allocating further entries. Revisions and offsets must be contiguous, object paths must stay inside the partition, and segment counts and lengths must stay within writer limits. Fetch chooses complete segments from manifest lengths before downloading objects.
+Root and page bodies are streamed under a 4 MiB cap. Schema-2 tail and page collections stop at 64 entries, while the legacy schema-1 reader retains its 10,000-entry limit. Traversal accepts page levels 0–10 and requires each child level to decrease, bounding depth even for cyclic or forged references. Per-page namespace, range, count, length, checksum, and tree-shape checks precede use. Root revisions agree with the indexed segment count plus the active tail.
+
+Only pages on the requested read or update path are loaded and validated. This avoids a whole-history scan; it is not a full-log integrity audit. A missing or corrupt accessed page fails the operation. Fetch selects complete segments using descriptor lengths before downloading record objects, including across leaf/tail boundaries. Empty tail-of-log reads and ListOffsets need only the root's validated range.
 
 Every selected segment's object metadata must match its bounded manifest length, and its body is streamed only up to that length before its SHA-256 is checked. Its Kafka CRC and raw record boundaries are checked before the upstream decoder may allocate. Record/header counts, reserved attributes, and delta arithmetic are validated, duplicate header keys are rejected, decoded offsets and unsupported semantics are checked, and safe deterministic re-encoding must reproduce the original bytes exactly.
 

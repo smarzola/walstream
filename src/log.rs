@@ -1,7 +1,7 @@
 //! Object-store-backed ordered log.
 //!
-//! Each topic has durable metadata and one versioned `manifest.json` per
-//! partition. Appends first create an immutable Kafka record-batch object, then make it visible by
+//! Each topic has durable metadata and one versioned index root per partition.
+//! Appends first create immutable record and index objects, then make them visible by
 //! conditionally creating or updating the manifest with its last-read ETag.
 //! Losing a manifest race leaves an invisible orphan and retries against fresh
 //! state; no acknowledged record depends on local process state.
@@ -30,6 +30,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::codec::{MAX_BATCH_RECORDS, decode_record_batches, inspect_record_batches};
+
+mod index;
+use index::{INDEX_SCHEMA, PAGE_ENTRIES, Root, Selection};
 
 const MANIFEST_SCHEMA: u32 = 1;
 const MAX_CAS_ATTEMPTS: usize = 128;
@@ -228,7 +231,7 @@ impl LogEngine {
         Ok(true)
     }
 
-    /// Append a non-empty record batch to the single supported partition.
+    /// Append a non-empty record batch to a durable partition.
     ///
     /// The immutable segment is uploaded first. The append becomes visible only
     /// when a create-or-update precondition commits the new manifest version.
@@ -255,12 +258,7 @@ impl LogEngine {
                 .load_manifest(topic, partition)
                 .await?
                 .unwrap_or_else(LoadedManifest::empty);
-            if loaded.manifest.segments.len() >= MAX_MANIFEST_SEGMENTS {
-                return Err(LogError::SegmentLimit {
-                    maximum: MAX_MANIFEST_SEGMENTS,
-                });
-            }
-            let base_offset = loaded.manifest.next_offset;
+            let base_offset = loaded.manifest.next_offset();
             let mut assigned = records.clone();
             for (delta, record) in assigned.iter_mut().enumerate() {
                 let delta_i32 = i32::try_from(delta).map_err(|_| LogError::OffsetOverflow)?;
@@ -301,20 +299,29 @@ impl LogEngine {
             let next_offset = base_offset
                 .checked_add(record_count)
                 .ok_or(LogError::OffsetOverflow)?;
-            let mut next = loaded.manifest.clone();
+            let mut next = match loaded.manifest {
+                LogManifest::Legacy(legacy) => {
+                    self.migrate_manifest(topic, partition, legacy).await?
+                }
+                LogManifest::Indexed(root) => root,
+            };
+            if next.tail.len() == PAGE_ENTRIES {
+                self.seal_tail(topic, partition, &mut next).await?;
+            }
             next.revision = next
                 .revision
                 .checked_add(1)
                 .ok_or(LogError::RevisionOverflow)?;
             next.next_offset = next_offset;
-            next.segments.push(Segment {
+            next.tail.push(Segment {
                 object: object.to_string(),
                 base_offset,
                 record_count: u32::try_from(assigned.len())
                     .map_err(|_| LogError::OffsetOverflow)?,
-                byte_length: u64::try_from(encoded.len()).map_err(|_| LogError::OffsetOverflow)?,
+                byte_length: encoded.len() as u64,
                 sha256: checksum,
             });
+            next.validate(&self.prefix, topic, partition)?;
 
             let bytes = Bytes::from(serde_json::to_vec(&next)?);
             if bytes.len() > MAX_MANIFEST_BYTES {
@@ -412,7 +419,7 @@ impl LogEngine {
             .load_manifest(topic, partition)
             .await?
             .unwrap_or_else(LoadedManifest::empty);
-        let high_watermark = loaded.manifest.next_offset;
+        let high_watermark = loaded.manifest.next_offset();
         if offset > high_watermark {
             return Err(LogError::OffsetOutOfRange {
                 offset,
@@ -427,40 +434,32 @@ impl LogEngine {
             });
         }
 
-        let mut selected = Vec::new();
-        let mut selected_bytes = 0_usize;
-        let mut oversized_first_batch = false;
-        for segment in loaded.manifest.segments {
-            if segment.last_offset()? < offset {
-                continue;
-            }
-            let byte_length =
-                usize::try_from(segment.byte_length).map_err(|_| LogError::OffsetOverflow)?;
-            let fits = selected_bytes
-                .checked_add(byte_length)
-                .is_some_and(|total| total <= maximum_bytes);
-            if !fits {
-                if selected.is_empty() && allow_oversized_first_batch {
-                    oversized_first_batch = true;
-                    selected.push(segment);
+        let mut selection = Selection::new(offset, maximum_bytes, allow_oversized_first_batch);
+        match loaded.manifest {
+            LogManifest::Legacy(manifest) => {
+                for segment in manifest.segments {
+                    if !selection.push(segment)? {
+                        break;
+                    }
                 }
-                break;
             }
-            selected_bytes += byte_length;
-            selected.push(segment);
+            LogManifest::Indexed(root) => {
+                self.indexed_segments(topic, partition, root, &mut selection)
+                    .await?
+            }
         }
 
         // Manifest lengths are validated and the protocol clamps selection,
         // but avoid one eager allocation from durable metadata regardless.
         let mut encoded = BytesMut::new();
-        for segment in selected {
+        for segment in selection.segments {
             let bytes = self.read_segment(&segment).await?;
             encoded.extend_from_slice(&bytes);
         }
         Ok(BoundedFetch {
             records: encoded.freeze(),
             high_watermark,
-            oversized_first_batch,
+            oversized_first_batch: selection.oversized_first_batch,
         })
     }
 
@@ -547,7 +546,7 @@ impl LogEngine {
             .manifest;
         Ok(OffsetRange {
             earliest: 0,
-            latest: manifest.next_offset,
+            latest: manifest.next_offset(),
         })
     }
 
@@ -632,11 +631,39 @@ impl LogEngine {
                             detail: format!("manifest body exceeds {MAX_MANIFEST_BYTES} bytes"),
                         },
                     })?;
-                let manifest: Manifest =
-                    serde_json::from_slice(&bytes).map_err(|source| LogError::InvalidManifest {
-                        detail: source.to_string(),
+                #[derive(Deserialize)]
+                struct Schema {
+                    schema: u32,
+                }
+                let Schema { schema } =
+                    serde_json::from_slice(&bytes).map_err(|e| LogError::InvalidManifest {
+                        detail: e.to_string(),
                     })?;
-                manifest.validate(&self.prefix, topic, partition)?;
+                let manifest = match schema {
+                    MANIFEST_SCHEMA => {
+                        let legacy: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
+                            LogError::InvalidManifest {
+                                detail: e.to_string(),
+                            }
+                        })?;
+                        legacy.validate(&self.prefix, topic, partition)?;
+                        LogManifest::Legacy(legacy)
+                    }
+                    INDEX_SCHEMA => {
+                        let root: Root = serde_json::from_slice(&bytes).map_err(|e| {
+                            LogError::InvalidManifest {
+                                detail: e.to_string(),
+                            }
+                        })?;
+                        root.validate(&self.prefix, topic, partition)?;
+                        LogManifest::Indexed(root)
+                    }
+                    _ => {
+                        return Err(LogError::InvalidManifest {
+                            detail: format!("unsupported manifest schema {schema}"),
+                        });
+                    }
+                };
                 Ok(Some(LoadedManifest {
                     manifest,
                     version: Some(version),
@@ -705,45 +732,38 @@ fn deserialize_segments<'de, D>(deserializer: D) -> Result<Vec<Segment>, D::Erro
 where
     D: Deserializer<'de>,
 {
-    struct BoundedSegments;
+    deserialize_bounded::<D, Segment, MAX_MANIFEST_SEGMENTS>(deserializer)
+}
 
-    impl<'de> Visitor<'de> for BoundedSegments {
-        type Value = Vec<Segment>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(
-                formatter,
-                "at most {MAX_MANIFEST_SEGMENTS} segment descriptors"
-            )
+fn deserialize_bounded<'de, D, T, const N: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Bounded<T, const N: usize>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>, const N: usize> Visitor<'de> for Bounded<T, N> {
+        type Value = Vec<T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "at most {N} metadata entries")
         }
-
-        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-        where
-            A: SeqAccess<'de>,
-        {
-            if sequence
-                .size_hint()
-                .is_some_and(|size| size > MAX_MANIFEST_SEGMENTS)
-            {
-                return Err(A::Error::custom("manifest segment limit exceeded"));
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+            if sequence.size_hint().is_some_and(|size| size > N) {
+                return Err(A::Error::custom("metadata entry limit exceeded"));
             }
-            let mut segments = Vec::with_capacity(
-                sequence
-                    .size_hint()
-                    .unwrap_or_default()
-                    .min(MAX_MANIFEST_SEGMENTS),
-            );
-            while let Some(segment) = sequence.next_element()? {
-                if segments.len() == MAX_MANIFEST_SEGMENTS {
-                    return Err(A::Error::custom("manifest segment limit exceeded"));
+            let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or_default().min(N));
+            while values.len() < N {
+                match sequence.next_element()? {
+                    Some(value) => values.push(value),
+                    None => return Ok(values),
                 }
-                segments.push(segment);
             }
-            Ok(segments)
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(A::Error::custom("metadata entry limit exceeded"));
+            }
+            Ok(values)
         }
     }
-
-    deserializer.deserialize_seq(BoundedSegments)
+    deserializer.deserialize_seq(Bounded::<T, N>(std::marker::PhantomData))
 }
 
 impl Default for Manifest {
@@ -770,47 +790,7 @@ impl Manifest {
             });
         }
 
-        let expected_prefix = format!("{prefix}/topics/{topic}/{partition}/segments/");
-        let mut next_offset = 0_i64;
-        let mut objects = HashSet::new();
-        for segment in &self.segments {
-            if segment.base_offset != next_offset {
-                return Err(LogError::InvalidManifest {
-                    detail: "segment offsets are not contiguous".into(),
-                });
-            }
-            if segment.record_count == 0 || segment.byte_length == 0 {
-                return Err(LogError::InvalidManifest {
-                    detail: "segment has an empty record or byte count".into(),
-                });
-            }
-            if segment.record_count as usize > MAX_BATCH_RECORDS
-                || segment.byte_length > MAX_BATCH_BYTES as u64
-            {
-                return Err(LogError::InvalidManifest {
-                    detail: "segment exceeds the writer's record or byte bound".into(),
-                });
-            }
-            if !segment.object.starts_with(&expected_prefix)
-                || !segment.object.ends_with(".batch")
-                || !objects.insert(&segment.object)
-            {
-                return Err(LogError::InvalidManifest {
-                    detail: "segment object is outside the partition or duplicated".into(),
-                });
-            }
-            if segment.sha256.len() != 64
-                || !segment.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(LogError::InvalidManifest {
-                    detail: "segment checksum is not a SHA-256 hex digest".into(),
-                });
-            }
-            next_offset = segment
-                .last_offset()?
-                .checked_add(1)
-                .ok_or(LogError::OffsetOverflow)?;
-        }
+        let next_offset = validate_segments(&self.segments, 0, prefix, topic, partition)?;
         if self.next_offset != next_offset {
             return Err(LogError::InvalidManifest {
                 detail: "next offset does not match committed segments".into(),
@@ -818,6 +798,59 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+fn valid_checksum(checksum: &str) -> bool {
+    checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_segments(
+    segments: &[Segment],
+    start: i64,
+    prefix: &str,
+    topic: &str,
+    partition: i32,
+) -> Result<i64, LogError> {
+    let expected_prefix = format!("{prefix}/topics/{topic}/{partition}/segments/");
+    let mut next_offset = start;
+    let mut objects = HashSet::new();
+    for segment in segments {
+        if segment.base_offset != next_offset {
+            return Err(LogError::InvalidManifest {
+                detail: "segment offsets are not contiguous".into(),
+            });
+        }
+        if segment.record_count == 0 || segment.byte_length == 0 {
+            return Err(LogError::InvalidManifest {
+                detail: "segment has an empty record or byte count".into(),
+            });
+        }
+        if segment.record_count as usize > MAX_BATCH_RECORDS
+            || segment.byte_length > MAX_BATCH_BYTES as u64
+        {
+            return Err(LogError::InvalidManifest {
+                detail: "segment exceeds the writer's record or byte bound".into(),
+            });
+        }
+        if !segment.object.starts_with(&expected_prefix)
+            || !segment.object.ends_with(".batch")
+            || !objects.insert(&segment.object)
+        {
+            return Err(LogError::InvalidManifest {
+                detail: "segment object is outside the partition or duplicated".into(),
+            });
+        }
+        if !valid_checksum(&segment.sha256) {
+            return Err(LogError::InvalidManifest {
+                detail: "segment checksum is not a SHA-256 hex digest".into(),
+            });
+        }
+        next_offset = segment
+            .last_offset()?
+            .checked_add(1)
+            .ok_or(LogError::OffsetOverflow)?;
+    }
+    Ok(next_offset)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -838,16 +871,48 @@ impl Segment {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum LogManifest {
+    Legacy(Manifest),
+    Indexed(Root),
+}
+
+impl LogManifest {
+    fn next_offset(&self) -> i64 {
+        match self {
+            Self::Legacy(m) => m.next_offset,
+            Self::Indexed(m) => m.next_offset,
+        }
+    }
+
+    #[cfg(test)]
+    fn tail(&self) -> &[Segment] {
+        match self {
+            Self::Legacy(m) => &m.segments,
+            Self::Indexed(m) => &m.tail,
+        }
+    }
+
+    #[cfg(test)]
+    fn tail_mut(&mut self) -> &mut [Segment] {
+        match self {
+            Self::Legacy(m) => &mut m.segments,
+            Self::Indexed(m) => &mut m.tail,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LoadedManifest {
-    manifest: Manifest,
+    manifest: LogManifest,
     version: Option<UpdateVersion>,
 }
 
 impl LoadedManifest {
     fn empty() -> Self {
         Self {
-            manifest: Manifest::default(),
+            manifest: LogManifest::Indexed(Root::default()),
             version: None,
         }
     }
@@ -886,9 +951,6 @@ pub enum LogError {
     /// Declared record count exceeded the bounded decoder limit.
     #[error("batch contains {actual} records; maximum is {maximum}")]
     TooManyRecords { actual: usize, maximum: usize },
-    /// The partition has reached the manifest's bounded segment count.
-    #[error("partition manifest reached its limit of {maximum} segments")]
-    SegmentLimit { maximum: usize },
     /// The serialized manifest exceeded its bounded object size.
     #[error("manifest is {actual} bytes; maximum is {maximum}")]
     ManifestTooLarge { actual: usize, maximum: usize },
@@ -1083,7 +1145,7 @@ mod tests {
 
     use super::*;
 
-    fn record(value: &str) -> Record {
+    pub(super) fn record(value: &str) -> Record {
         Record {
             transactional: false,
             control: false,
@@ -1112,7 +1174,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .manifest;
-        let segment_path = Path::from(manifest.segments[0].object.clone());
+        let segment_path = Path::from(manifest.tail()[0].object.clone());
         let mut forged = engine
             .store
             .get(&segment_path)
@@ -1125,7 +1187,7 @@ mod tests {
         mutate(&mut forged);
         let checksum = crc32c::crc32c(&forged[21..]);
         forged[17..21].copy_from_slice(&checksum.to_be_bytes());
-        manifest.segments[0].sha256 = sha256_hex(&forged);
+        manifest.tail_mut()[0].sha256 = sha256_hex(&forged);
         engine
             .store
             .put(&segment_path, Bytes::from(forged).into())
@@ -1734,11 +1796,7 @@ mod tests {
         }
         json.push_str("]}");
         let error = serde_json::from_str::<Manifest>(&json).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("manifest segment limit exceeded")
-        );
+        assert!(error.to_string().contains("metadata entry limit exceeded"));
     }
 
     #[tokio::test]
@@ -1906,7 +1964,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .manifest;
-        let path = Path::parse(&manifest.segments[0].object).unwrap();
+        let path = Path::parse(&manifest.tail()[0].object).unwrap();
         engine
             .store
             .put(&path, PutPayload::from_static(b"corrupt"))

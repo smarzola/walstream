@@ -70,9 +70,11 @@ The default maximum request frame is 16 MiB. Before generated decoding, an alloc
 An append:
 
 1. reads the committed partition manifest;
-2. assigns contiguous offsets and writes one immutable record-batch object;
-3. publishes it by conditionally creating or ETag-updating the manifest;
-4. retries from fresh state if another writer wins the manifest race.
+2. assigns contiguous offsets and encodes the new record batch;
+3. seals a full 64-segment tail into immutable index pages when necessary;
+4. writes the immutable record-batch object;
+5. publishes the bounded index root by conditionally creating or ETag-updating the manifest;
+6. retries from fresh state if another writer wins the manifest race.
 
 Only the manifest CAS is the commit point. A crash before it can leave an invisible orphan object; a crash after an acknowledged CAS leaves all required state in the bucket. Reads validate manifest invariants, object length, SHA-256, Kafka CRC and raw allocation bounds, logical offsets, unsupported semantics, and exact canonical re-encoding.
 
@@ -81,11 +83,16 @@ Objects live under:
 ```text
 <prefix>/clusters/<cluster-id>/topics/<topic>/metadata.json
 <prefix>/clusters/<cluster-id>/topics/<topic>/<partition>/manifest.json
+<prefix>/clusters/<cluster-id>/topics/<topic>/<partition>/index/<uuid>.json
 <prefix>/clusters/<cluster-id>/topics/<topic>/<partition>/segments/<uuid>.batch
 <prefix>/clusters/<cluster-id>/groups/<group-id>/offsets.json
 ```
 
 Topic metadata is schema-versioned and conditionally created. Existing installations that have a valid partition-0 manifest but no topic metadata are read as one-partition topics and upgraded without rewriting their log.
+
+New partition manifests use schema 2: a root with at most 64 active segment descriptors and a reference to an immutable offset index. Sealed leaves contain 64 descriptors, branches contain at most 64 child references, and each metadata body retains the 4 MiB safety cap. The index supports up to 11 page levels, covering the positive Kafka offset space. Appends update the bounded root and, on rollover, the rightmost index path. Fetch locates requested offsets through the index; it does not load the full partition history. There is no longer a 10,000-append limit.
+
+Schema-1 partition manifests remain readable. Their next successful append atomically publishes schema 2 using existing record objects and offsets. Reads alone do not convert the partition manifest. **Older Walstream binaries cannot serve an upgraded partition.** Stop old processes before upgrading; mixed-version operation and downgrade after conversion are unsupported. No record objects are deleted, and orphan or superseded index pages remain stored until a future collection implementation.
 
 Committed group offsets and optional metadata use a bounded, schema-versioned object with the same conditional-create/ETag-update discipline. They survive complete broker replacement. Membership, generations, assignments, heartbeats, and session deadlines exist only in the broker process, so retained consumers must rediscover the coordinator and rejoin with new member identities after replacement. Join, leave, and session expiry rebalance only the affected group; the leader receives every member's selected-protocol metadata and must submit exactly one immutable assignment per member for the new generation.
 
@@ -124,6 +131,14 @@ WALSTREAM_E2E_BACKEND=minio ./scripts/test-s3-e2e.sh
 
 Every backend selection proves Walstream's required conditional create/update behavior, stock-client discovery and produce/fetch, recovery after hard process replacement, and concurrent independent writers publishing unique contiguous offsets. It does not establish general S3 compatibility, backend production readiness, or comparative performance; RustFS remains a beta release. The script removes its selected test container and bucket data when it exits. It requires `container`, `container-compose`, and `jq`; it does not use Docker.
 
+The index walkthrough launches the actual broker against its own disposable RustFS container, makes 25,000 separate appends, reads all records after replacement, upgrades a legacy fixture, kills a broker with a root update intercepted before publication, and verifies corrupt-page rejection:
+
+```bash
+./scripts/test-log-index.sh
+```
+
+It requires Python 3 for the local fault proxy in addition to the existing container tools. `--appends 129` runs a short rollover smoke walkthrough. `--baseline-broker /path/to/old/walstream` also exercises rejection of an upgraded partition by an actual older binary. This is a correctness walkthrough, not a throughput benchmark.
+
 ## Explicit non-goals
 
 - static membership, the newer consumer group protocol, offset retention, transactions, and idempotent producers;
@@ -132,7 +147,6 @@ Every backend selection proves Walstream's required conditional create/update be
 - Kafka authentication/authorization or TLS termination;
 - compressed record batches or duplicate Kafka header keys;
 - throughput comparable to Kafka: every append uploads an object and contends on one per-partition manifest CAS.
-- more than 10,000 committed segment objects per partition in the current manifest format.
 
 Run Walstream behind appropriate network and TLS controls. The MVP has no client authentication and has not been production-hardened or scale-tested.
 
