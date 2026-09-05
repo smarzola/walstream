@@ -85,11 +85,20 @@ Review policy: one fresh final reviewer using Sol (`gpt-5.6-sol`) with no inheri
 Starting branch/base: `main` at `3f881b34408a54efc00649768d162e32d87a383c`.
 Planned implementation branch: `feat/scalable-partition-log-metadata`.
 
-- [ ] Milestone 1: integrated bounded index and schema-v1 compatibility; focused log/protocol/stock-client checks and initial runtime use pass.
-- [ ] Milestone 2: growth, targeted lookup, migration ceiling, concurrency, and failure criteria pass; record observed page bounds and metadata operation evidence.
+- [x] Milestone 1: integrated bounded index and schema-v1 compatibility; focused log/protocol/stock-client checks and initial runtime use pass.
+- [x] Milestone 2: growth, targeted lookup, migration ceiling, concurrency, and failure criteria pass; record observed page bounds and metadata operation evidence.
 - [ ] Milestone 3: real-broker scenarios, relevant full regressions, and documentation pass.
 
 After a coherent milestone passes its checks and applicable runtime acceptance, record evidence and decisions here and commit it with a focused Conventional Commit. Record the hash in a later note/report. Final independent review and both runtime records remain separate completion gates.
+
+Checkpoint evidence, 2026-09-05:
+
+- Milestones 1–2: schema-2 root, 64-entry active tail/leaves/branches, 11-level traversal ceiling, shared bounded deserialization and legacy validation implemented. Kept the existing 4 MiB metadata-body cap; normal roots remain much smaller. Index pages and data objects remain immutable, and the root ETag update is still the sole publication point.
+- `cargo test --lib log:: -- --nocapture`: 24 passed. After adding rollover operation accounting and a missing-page case, `cargo test --lib log::index:: -- --nocapture`: 5 passed. Growth fixture completed 25,000 appends and exact complete readback. Historical seek used 4 GETs/14,838 bytes at 129 appends, 5 GETs/30,714 bytes at 8,193, and 5 GETs/40,479 bytes at 25,000. A rollover at 25,024 prior appends used 4 metadata GETs, 4 metadata PUTs, and 17,601 bytes read; an ordinary append used 2 GETs and 1 PUT. ListOffsets used 2 metadata GETs (topic and root).
+- The full 10,000-segment legacy fixture upgraded and all original record bytes remained unchanged. Deterministic tests covered concurrent migration/rollover, failure before page/root publication, committed-but-lost response, malformed references, corrupt and missing pages, and bounds.
+- `cargo test --test kafka_protocol --test stock_client`: 3 protocol and 2 stock-client tests passed outside the sandbox. The initial sandbox run could not bind sockets; no code repair was needed. Initial dependency fetch also required network access outside the sandbox.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed for the initial integrated implementation. Full final checks remain below.
+- Initial implementer runtime: `./scripts/test-log-index.sh --appends 129` built release code and launched five real broker processes against owned RustFS container `walstream-index-1788645415-63366`. All scenarios passed: root 594 bytes, root index page 587 bytes, full replacement readback, schema-1 read unchanged then schema-2 append with unchanged record objects, proxy-intercepted root PUT followed by hard process loss and offset-64 recovery, and corrupt-page error through Kafka Fetch. The helper removed its container; output is in `/tmp/walstream-index-smoke.log`. The full-size walkthrough and independent runtime are still pending.
 
 ## Automated Verification
 

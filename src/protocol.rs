@@ -903,7 +903,6 @@ fn log_error_code(error: &LogError) -> i16 {
         | LogError::Codec { .. } => ResponseError::CorruptMessage.code(),
         LogError::OffsetOverflow
         | LogError::RevisionOverflow
-        | LogError::SegmentLimit { .. }
         | LogError::ManifestTooLarge { .. }
         | LogError::Serialization(_)
         | LogError::ObjectStore(_)

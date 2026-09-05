@@ -224,5 +224,41 @@ async fn binary_recovers_from_s3_and_serializes_independent_writers() {
             b"right".as_slice(),
         ])
     );
+    // Cross two sealed leaves on every backend, then recover the indexed
+    // history in another process. Initial append contained two records.
+    for offset in 4..131 {
+        assert_eq!(
+            recovered
+                .produce(
+                    vec![record(&format!("indexed-{offset}"), 5_000)],
+                    Compression::NoCompression
+                )
+                .await
+                .unwrap(),
+            vec![offset]
+        );
+    }
     second.stop();
+    let third = BrokerProcess::start(&bucket, &endpoint, &prefix, cluster).await;
+    let client = ClientBuilder::new(vec![third.address.to_string()])
+        .build()
+        .await
+        .unwrap();
+    let indexed = client
+        .partition_client("events", 0, UnknownTopicHandling::Error)
+        .await
+        .unwrap();
+    let (records, high_watermark) = indexed.fetch_records(0, 1..1_000_000, 1_000).await.unwrap();
+    assert_eq!(high_watermark, 131);
+    assert_eq!(
+        records.iter().map(|entry| entry.offset).collect::<Vec<_>>(),
+        (0..131).collect::<Vec<_>>()
+    );
+    for entry in records.iter().skip(4) {
+        assert_eq!(
+            entry.record.value.as_deref(),
+            Some(format!("indexed-{}", entry.offset).as_bytes())
+        );
+    }
+    third.stop();
 }
