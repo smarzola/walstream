@@ -361,7 +361,7 @@ async fn main() -> Result<()> {
         "killed maintenance before publication and after three deletes; rerun reclaimed remaining 78 objects"
     );
 
-    for schema in [1, 2] {
+    for schema in [1, 2, 3] {
         let topic = format!("legacy{schema}");
         let legacy = client(address, &topic).await?;
         for n in 0..16 {
@@ -378,17 +378,28 @@ async fn main() -> Result<()> {
         }
         let old = if schema == 1 {
             json!({"schema":1,"revision":16,"next_offset":16,"segments":segments})
-        } else {
+        } else if schema == 2 {
             original["schema"] = json!(2);
             original["tail"] = segments;
             original.as_object_mut().unwrap().remove("start_offset");
             original.as_object_mut().unwrap().remove("adopted_at_ms");
+            original
+        } else {
+            original["schema"] = json!(3);
             original
         };
         store
             .put(&path, Bytes::from(serde_json::to_vec(&old)?).into())
             .await?;
         check_range(&legacy, 0, 16).await?;
+        if schema == 3 {
+            if let Some(baseline) = &args.baseline_broker {
+                let (old_broker, old_address) = start(&args.store, endpoint, baseline).await?;
+                let old_client = client(old_address, &topic).await?;
+                check_range(&old_client, 0, 16).await?;
+                drop(old_broker);
+            }
+        }
         let adopted = maintain(
             &args,
             endpoint,
@@ -396,6 +407,11 @@ async fn main() -> Result<()> {
             &["--max-age-ms", "60000", "--apply"],
         )?;
         ensure!(adopted["format_adoption"] == true && adopted["expired_batches"] == 0);
+        if schema == 3 {
+            ensure!(
+                read_json(store.as_ref(), &path).await?["adopted_at_ms"] == old["adopted_at_ms"]
+            );
+        }
         for (object, original) in bytes {
             ensure!(store.get(&object).await?.bytes().await? == original);
         }

@@ -64,14 +64,22 @@ One fresh final reviewer: `gpt-5.6-sol`, `fork_turns: none`; read the pursue-goa
 
 ## Status
 
-- [ ] Native producer initialization and validated batch handling.
-- [ ] Atomic sequence tracking and maintenance/recovery integration.
+- [x] Native producer initialization and validated batch handling.
+- [x] Atomic sequence tracking and maintenance/recovery integration.
 - [ ] Complete verification, independent runtime review, and ready PR.
 
-Implementer runtime: pending.
+Implementer runtime: first native walkthrough passed, with final-boundary rerun pending. `scripts/test-idempotent-producers.sh` built and launched the broker against disposable RustFS, ran the pinned clients in Apple Container, withheld each initial successful Produce response, replaced the broker, and observed the same producer retry. IDs 0–3 stayed at epoch/sequence zero with byte-identical payloads. All returned offset zero without changing the partition root; subsequent records used offset one. Normal readback was `[0:first, 1:next]`; retention-before-retry readback was `[1:next]`, with earliest/latest 1/2. Raw output: `/tmp/walstream-producer-runtime.log`; snapshots and request traces: `/var/folders/ww/y0g67mbx2mn0s9rt57gy9c3r0000gn/T/walstream-producers.bBq2uw`.
+
+Verification so far: formatting and Clippy pass. `cargo test --all-targets` passes 92 library, 1 CLI, 3 protocol-boundary, and 2 stock-client tests; the separate S3 test passed on RustFS, SeaweedFS, and MinIO through the existing harness. Maintenance passed with the preserved schema-3 baseline executable `/tmp/walstream-producers-schema3`, including schema 1/2/3 conversion, record-byte preservation, old-binary rejection, and unchanged schema-3 adoption time. Retained Java/librdkafka consumer-group recovery passed. Logs: `/tmp/walstream-producer-{tests,clippy,maintenance,backends,groups}.log`. Full 25,000-append index walkthrough remains running.
+
+Implementation decisions: InitProducerId v0–4 supports null transactional IDs; transactions fail explicitly. Producer pages use 64-entry copy-on-write B+tree pages, levels 0–12, and five-entry histories with normalized-record SHA-256 fingerprints. Epochs increase without wrapping; sequence advancement uses modulo 2^31. A complete partition request is decided before writes and publishes once, preserving native batches and allowing duplicate prefixes followed by new data. More-than-five-batch replay can fail once its earliest identity leaves the window, as documented. Maintenance traces all producer pages, preserves the directory through trims, and counts it under the existing object budget.
+
+Meaningful new tests cover concurrent allocation and same/different producers, ambiguous initialization/publication, exact duplicate no-write behavior, whole-request validation, epoch fencing, sequence wrap, five-batch eviction, 2,100 producer IDs through an internal split, full expiry, stale paused writers/readers versus GC, and corrupt/missing referenced state. Initial failures were obsolete no-idempotence/schema assertions and a generated default request fixture using an empty transactional ID; valid nontransactional fixtures now set it to null explicitly. No criteria were weakened.
+
+Early bounded design review: completed read-only by Sol; publication, schema preservation, and complete producer-graph tracing invariants incorporated. It does not substitute for final review.
 Independent runtime: pending.
 Final review: pending.
-PR: pending draft creation after approved goal commit.
+PR: [draft #6](https://github.com/smarzola/walstream/pull/6), opened after goal commit `2128fae`.
 Goal status: approved and in progress.
 
 On resume, reconcile this contract with current git/PR state and actual evidence. Continue unfinished work without weakening criteria or repeating valid checks. Record completed behavior, material decisions, commands/results, runtime records, and review disposition here; commit only explicit in-scope paths. Completion requires all success criteria and verified ready-PR delivery.

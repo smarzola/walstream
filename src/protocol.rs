@@ -14,6 +14,8 @@ use kafka_protocol::{
         find_coordinator_response::FindCoordinatorResponse,
         heartbeat_request::HeartbeatRequest,
         heartbeat_response::HeartbeatResponse,
+        init_producer_id_request::InitProducerIdRequest,
+        init_producer_id_response::InitProducerIdResponse,
         join_group_request::JoinGroupRequest,
         join_group_response::{JoinGroupResponse, JoinGroupResponseMember},
         leave_group_request::LeaveGroupRequest,
@@ -61,6 +63,7 @@ pub const MAX_FETCH_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Kafka API/version surface advertised by Walstream.
 pub const SUPPORTED_APIS: &[(ApiKey, i16, i16)] = &[
     (ApiKey::Produce, 7, 7),
+    (ApiKey::InitProducerId, 0, 4),
     (ApiKey::Fetch, 4, 4),
     (ApiKey::ListOffsets, 3, 3),
     (ApiKey::Metadata, 4, 4),
@@ -203,6 +206,10 @@ pub async fn handle_request(
         RequestKind::ApiVersions(_) => (ResponseKind::ApiVersions(api_versions_response()), true),
         RequestKind::Metadata(request) => (
             ResponseKind::Metadata(metadata_response(request, version, engine, identity).await?),
+            true,
+        ),
+        RequestKind::InitProducerId(request) => (
+            ResponseKind::InitProducerId(init_producer_id_response(request, engine).await),
             true,
         ),
         RequestKind::Produce(request) => {
@@ -364,6 +371,30 @@ async fn metadata_response(
         .with_topics(topics))
 }
 
+async fn init_producer_id_response(
+    request: InitProducerIdRequest,
+    engine: &LogEngine,
+) -> InitProducerIdResponse {
+    let mut response = InitProducerIdResponse::default();
+    if request.transactional_id.is_some() {
+        response.error_code = ResponseError::UnsupportedForMessageFormat.code();
+    } else if request.producer_id.0 < -1
+        || request.producer_epoch < -1
+        || (request.producer_id == -1) != (request.producer_epoch == -1)
+    {
+        response.error_code = ResponseError::InvalidRequest.code();
+    } else {
+        match engine.allocate_producer_id().await {
+            Ok(id) => {
+                response.producer_id = kafka_protocol::messages::ProducerId(id);
+                response.producer_epoch = 0;
+            }
+            Err(error) => response.error_code = log_error_code(&error),
+        }
+    }
+    response
+}
+
 async fn produce_response(request: ProduceRequest, engine: &LogEngine) -> ProduceResponse {
     let invalid_acks = !matches!(request.acks, -1..=1);
     let transactional = request.transactional_id.is_some();
@@ -378,11 +409,19 @@ async fn produce_response(request: ProduceRequest, engine: &LogEngine) -> Produc
             } else if transactional {
                 (ResponseError::UnsupportedForMessageFormat.code(), -1)
             } else {
-                match decode_records(partition.records) {
-                    Ok(records) => match engine.append(&name, partition.index, records).await {
-                        Ok(result) => (0, result.base_offset),
-                        Err(error) => (log_error_code(&error), -1),
-                    },
+                match decode_produce_batches(partition.records) {
+                    Ok(batches)
+                        if request.acks != -1
+                            && batches.iter().flatten().any(|r| r.producer_id >= 0) =>
+                    {
+                        (ResponseError::InvalidRequiredAcks.code(), -1)
+                    }
+                    Ok(batches) => {
+                        match engine.append_batches(&name, partition.index, batches).await {
+                            Ok(result) => (0, result.base_offset),
+                            Err(error) => (log_error_code(&error), -1),
+                        }
+                    }
                     Err(error_code) => (error_code, -1),
                 }
             };
@@ -403,14 +442,28 @@ async fn produce_response(request: ProduceRequest, engine: &LogEngine) -> Produc
     ProduceResponse::default().with_responses(topics)
 }
 
-fn decode_records(records: Option<Bytes>) -> Result<Vec<kafka_protocol::records::Record>, i16> {
+fn decode_produce_batches(
+    records: Option<Bytes>,
+) -> Result<Vec<Vec<kafka_protocol::records::Record>>, i16> {
     let records = records.ok_or(ResponseError::InvalidRequest.code())?;
     if records.is_empty() {
         return Err(ResponseError::InvalidRequest.code());
     }
     match decode_record_batches(records) {
-        Ok((_, records)) if records.is_empty() => Err(ResponseError::InvalidRequest.code()),
-        Ok((_, records)) => Ok(records),
+        Ok((inspection, _)) if inspection.batch_record_counts.contains(&0) => {
+            Err(ResponseError::InvalidRequest.code())
+        }
+        Ok((inspection, records)) => {
+            if records.iter().all(|r| r.producer_id == -1) {
+                return Ok(vec![records]);
+            }
+            let mut records = records.into_iter();
+            Ok(inspection
+                .batch_record_counts
+                .into_iter()
+                .map(|count| records.by_ref().take(count).collect())
+                .collect())
+        }
         Err(CodecError::UnsupportedCompression) => {
             Err(ResponseError::UnsupportedCompressionType.code())
         }
@@ -422,6 +475,11 @@ fn decode_records(records: Option<Bytes>) -> Result<Vec<kafka_protocol::records:
             Err(ResponseError::CorruptMessage.code())
         }
     }
+}
+
+#[cfg(test)]
+fn decode_records(records: Option<Bytes>) -> Result<Vec<kafka_protocol::records::Record>, i16> {
+    decode_produce_batches(records).map(|batches| batches.into_iter().flatten().collect())
 }
 
 async fn fetch_response(request: FetchRequest, engine: &LogEngine) -> FetchResponse {
@@ -887,6 +945,9 @@ fn log_error_code(error: &LogError) -> i16 {
         LogError::InvalidTopic { .. } => ResponseError::InvalidTopicException.code(),
         LogError::UnknownTopic { .. } => ResponseError::UnknownTopicOrPartition.code(),
         LogError::UnsupportedPartition { .. } => ResponseError::UnknownTopicOrPartition.code(),
+        LogError::OutOfOrderSequence => ResponseError::OutOfOrderSequenceNumber.code(),
+        LogError::InvalidProducerEpoch => ResponseError::InvalidProducerEpoch.code(),
+        LogError::ConflictingSequence => ResponseError::InvalidRecord.code(),
         LogError::EmptyBatch => ResponseError::InvalidRequest.code(),
         LogError::UnsupportedRecordSemantics => ResponseError::UnsupportedForMessageFormat.code(),
         LogError::InvalidTimestampRange => ResponseError::InvalidTimestamp.code(),
@@ -937,6 +998,7 @@ fn encode_response(
     debug_assert!(matches!(
         (api_key, &response),
         (ApiKey::Produce, ResponseKind::Produce(_))
+            | (ApiKey::InitProducerId, ResponseKind::InitProducerId(_))
             | (ApiKey::Fetch, ResponseKind::Fetch(_))
             | (ApiKey::ListOffsets, ResponseKind::ListOffsets(_))
             | (ApiKey::Metadata, ResponseKind::Metadata(_))
@@ -1618,6 +1680,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn producer_initialization_and_native_multi_batch_retries() {
+        let engine = LogEngine::in_memory("producer-wire").unwrap();
+        let transactional = InitProducerIdRequest::default().with_transactional_id(Some(
+            TransactionalId(StrBytes::from_static_str("transaction")),
+        ));
+        assert_eq!(
+            init_producer_id_response(transactional, &engine)
+                .await
+                .error_code,
+            ResponseError::UnsupportedForMessageFormat.code()
+        );
+        let invalid = InitProducerIdRequest::default()
+            .with_transactional_id(None)
+            .with_producer_epoch(0);
+        assert_eq!(
+            init_producer_id_response(invalid, &engine).await.error_code,
+            ResponseError::InvalidRequest.code()
+        );
+        assert_eq!(engine.allocate_producer_id().await.unwrap(), 0);
+        let mut encoded = BytesMut::new();
+        for sequence in [0, 2] {
+            encoded.extend_from_slice(
+                &encode_records(&crate::log::producer::tests::batch(0, 0, sequence, 2)).unwrap(),
+            );
+        }
+        let request = ProduceRequest::default()
+            .with_acks(-1)
+            .with_topic_data(vec![
+                TopicProduceData::default()
+                    .with_name(topic_name("events".into()))
+                    .with_partition_data(vec![
+                        PartitionProduceData::default()
+                            .with_index(0)
+                            .with_records(Some(encoded.freeze())),
+                    ]),
+            ]);
+        let bad_acks = produce_response(request.clone().with_acks(1), &engine).await;
+        assert_eq!(
+            bad_acks.responses[0].partition_responses[0].error_code,
+            ResponseError::InvalidRequiredAcks.code()
+        );
+        for _ in 0..2 {
+            let response = produce_response(request.clone(), &engine).await;
+            assert_eq!(response.responses[0].partition_responses[0].error_code, 0);
+            assert_eq!(response.responses[0].partition_responses[0].base_offset, 0);
+        }
+        let fetched = engine
+            .fetch_bounded("events", 0, 0, MAX_FETCH_PAYLOAD_BYTES, true)
+            .await
+            .unwrap();
+        let infos = RecordBatchDecoder::decode_batch_info(&mut fetched.records.clone()).unwrap();
+        assert_eq!(infos.len(), 2);
+        assert_eq!((infos[0].base_sequence, infos[1].base_sequence), (0, 2));
+        assert_eq!(fetched.high_watermark, 4);
+    }
+
+    #[tokio::test]
     async fn produce_rejects_timestamp_ranges_that_cannot_be_canonicalized() {
         let engine = LogEngine::in_memory("walstream/clusters/timestamp-range").unwrap();
         let mut first = record();
@@ -1717,6 +1836,24 @@ mod tests {
             assert!(matches!(response, ResponseKind::ApiVersions(_)));
         }
 
+        for version in 0..=4 {
+            let (_, response) = wire_round_trip(
+                &engine,
+                ApiKey::InitProducerId,
+                version,
+                RequestKind::InitProducerId(
+                    InitProducerIdRequest::default().with_transactional_id(None),
+                ),
+            )
+            .await;
+            let ResponseKind::InitProducerId(response) = response else {
+                panic!()
+            };
+            assert_eq!(response.error_code, 0);
+            assert_eq!(response.producer_id.0, i64::from(version));
+            assert_eq!(response.producer_epoch, 0);
+        }
+
         let metadata = MetadataRequest::default()
             .with_topics(Some(vec![
                 MetadataRequestTopic::default().with_name(Some(topic_name("matrix".into()))),
@@ -1782,6 +1919,8 @@ mod tests {
             .unwrap(),
         );
         for (api_key, version) in [
+            (ApiKey::InitProducerId, -1),
+            (ApiKey::InitProducerId, 5),
             (ApiKey::Produce, 6),
             (ApiKey::Produce, 8),
             (ApiKey::Fetch, 3),

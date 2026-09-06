@@ -107,6 +107,7 @@ impl Gate {
 struct Controls {
     gate: Mutex<Option<Arc<Gate>>>,
     root_fault: AtomicUsize,
+    allocator_fault: AtomicUsize,
     delete_fault_after: AtomicUsize,
     deletes: AtomicUsize,
     puts: AtomicUsize,
@@ -197,6 +198,8 @@ impl ObjectStore for Store {
         self.controls.puts.fetch_add(1, SeqCst);
         let fault = if path.as_ref().ends_with("/manifest.json") {
             self.controls.root_fault.swap(0, SeqCst)
+        } else if path.as_ref().ends_with("/producer-ids.json") {
+            self.controls.allocator_fault.swap(0, SeqCst)
         } else {
             0
         };
@@ -843,7 +846,7 @@ async fn schema_two_append_adopts_old_pages_and_records_receive_time() {
     else {
         unreachable!()
     };
-    assert_eq!(upgraded.schema, 3);
+    assert_eq!(upgraded.schema, INDEX_SCHEMA);
     assert!(upgraded.adopted_at_ms.unwrap() >= before);
     assert!(upgraded.tail.last().unwrap().received_at_ms.unwrap() >= before);
     let age = MaintenanceOptions {
@@ -980,4 +983,230 @@ async fn a_failure_after_retry_preserves_the_last_confirmed_publication_report()
         LogError::MaintenanceBudget { maximum: 100 }
     ));
     assert_eq!(store.controls.deletes.load(SeqCst), deletes);
+}
+
+#[tokio::test]
+async fn producer_request_validation_is_atomic_and_duplicate_retries_never_write() {
+    use crate::log::producer::tests::batch;
+    let (engine, store) = fixture(0).await;
+    engine.ensure_topic("events", 0).await.unwrap();
+    let puts = store.controls.puts.load(SeqCst);
+    assert!(matches!(
+        engine
+            .append_batches("events", 0, vec![batch(7, 0, 0, 1), batch(7, 0, 2, 1)])
+            .await,
+        Err(LogError::OutOfOrderSequence)
+    ));
+    assert_eq!(store.controls.puts.load(SeqCst), puts);
+    engine
+        .append_batches("events", 0, (0..5).map(|s| batch(7, 0, s, 1)).collect())
+        .await
+        .unwrap();
+    let puts = store.controls.puts.load(SeqCst);
+    assert_eq!(
+        engine
+            .append_batches("events", 0, (0..5).map(|s| batch(7, 0, s, 1)).collect())
+            .await
+            .unwrap(),
+        AppendResult {
+            base_offset: 0,
+            last_offset: 4
+        }
+    );
+    let mut conflicting = batch(7, 0, 4, 1);
+    conflicting[0].value = Some(Bytes::from_static(b"conflict"));
+    assert!(matches!(
+        engine
+            .append_batches("events", 0, vec![batch(7, 0, 5, 1), conflicting])
+            .await,
+        Err(LogError::ConflictingSequence)
+    ));
+    assert_eq!(store.controls.puts.load(SeqCst), puts);
+    assert_eq!(
+        engine
+            .append_batches("events", 0, vec![batch(7, 0, 4, 1), batch(7, 0, 5, 1)])
+            .await
+            .unwrap(),
+        AppendResult {
+            base_offset: 4,
+            last_offset: 5
+        }
+    );
+    assert!(matches!(
+        engine.append("events", 0, batch(7, 0, 0, 1)).await,
+        Err(LogError::OutOfOrderSequence)
+    ));
+    engine.append("events", 0, batch(7, 1, 0, 1)).await.unwrap();
+    let puts = store.controls.puts.load(SeqCst);
+    assert!(matches!(
+        engine.append("events", 0, batch(7, 0, 6, 1)).await,
+        Err(LogError::InvalidProducerEpoch)
+    ));
+    assert!(matches!(
+        engine.append("events", 0, batch(7, 2, 1, 1)).await,
+        Err(LogError::OutOfOrderSequence)
+    ));
+    assert_eq!(store.controls.puts.load(SeqCst), puts);
+    engine
+        .append("events", 0, vec![record("ordinary")])
+        .await
+        .unwrap();
+    let report = engine
+        .maintain(
+            "events",
+            0,
+            &MaintenanceOptions {
+                apply: true,
+                max_bytes: Some(0),
+                ..MaintenanceOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!((report.start_offset, report.next_offset), (8, 8));
+    let puts = store.controls.puts.load(SeqCst);
+    assert_eq!(
+        engine
+            .append("events", 0, batch(7, 1, 0, 1))
+            .await
+            .unwrap()
+            .base_offset,
+        6
+    );
+    assert_eq!(store.controls.puts.load(SeqCst), puts);
+    assert!(engine.fetch("events", 0, 8).await.unwrap().is_empty());
+    assert_eq!(
+        engine
+            .append("events", 0, batch(7, 1, 1, 1))
+            .await
+            .unwrap()
+            .base_offset,
+        8
+    );
+}
+
+#[tokio::test]
+async fn producer_publication_failures_and_collection_retry_whole_snapshot() {
+    use crate::log::producer::tests::batch;
+    let (engine, store) = fixture(0).await;
+    engine.ensure_topic("events", 0).await.unwrap();
+    for fault in 1..=3 {
+        store.controls.root_fault.store(fault, SeqCst);
+        let result = engine
+            .append("events", 0, batch(fault as i64, 0, 0, 1))
+            .await;
+        if fault < 3 {
+            assert!(result.is_err());
+        }
+        let retried = engine
+            .append("events", 0, batch(fault as i64, 0, 0, 1))
+            .await
+            .unwrap();
+        assert_eq!(retried.base_offset, fault as i64 - 1);
+    }
+    let gate = store.gate("put", "/manifest.json");
+    let writer = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.append("events", 0, batch(1, 0, 1, 1)).await })
+    };
+    gate.entered().await;
+    let report = engine
+        .maintain(
+            "events",
+            0,
+            &MaintenanceOptions {
+                apply: true,
+                ..MaintenanceOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        report.collected_objects >= 2,
+        "collect tentative record and producer page before resuming the losing writer"
+    );
+    gate.resume.notify_one();
+    assert_eq!(writer.await.unwrap().unwrap().base_offset, 3);
+    let gate = store.gate("get", "/producer-state/");
+    let writer = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.append("events", 0, batch(1, 0, 2, 1)).await })
+    };
+    gate.entered().await;
+    engine.append("events", 0, batch(2, 0, 1, 1)).await.unwrap();
+    engine
+        .maintain(
+            "events",
+            0,
+            &MaintenanceOptions {
+                apply: true,
+                ..MaintenanceOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    gate.resume.notify_one();
+    assert_eq!(writer.await.unwrap().unwrap().base_offset, 5);
+    assert_eq!(engine.fetch("events", 0, 0).await.unwrap().len(), 6);
+    let LogManifest::Indexed(root) = engine
+        .load_manifest("events", 0)
+        .await
+        .unwrap()
+        .unwrap()
+        .manifest
+    else {
+        panic!()
+    };
+    let object = Path::from(root.producers.unwrap().object);
+    let bytes = store
+        .inner
+        .get(&object)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    store
+        .inner
+        .put(&object, Bytes::from_static(b"corrupt").into())
+        .await
+        .unwrap();
+    assert!(matches!(
+        engine.append("events", 0, batch(1, 0, 3, 1)).await,
+        Err(LogError::InvalidManifest { .. })
+    ));
+    assert!(
+        engine
+            .maintain(
+                "events",
+                0,
+                &MaintenanceOptions {
+                    apply: true,
+                    max_bytes: Some(0),
+                    ..MaintenanceOptions::default()
+                }
+            )
+            .await
+            .is_err()
+    );
+    store.inner.put(&object, bytes.into()).await.unwrap();
+    store.inner.delete(&object).await.unwrap();
+    assert!(matches!(
+        engine.append("events", 0, batch(1, 0, 3, 1)).await,
+        Err(LogError::ObjectStore(StoreError::NotFound { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn producer_allocator_never_reuses_an_ambiguously_committed_id() {
+    let (engine, store) = fixture(0).await;
+    store.controls.allocator_fault.store(2, SeqCst);
+    assert!(engine.allocate_producer_id().await.is_err());
+    let restarted = LogEngine::new(store.clone(), "retention").unwrap();
+    assert_eq!(restarted.allocate_producer_id().await.unwrap(), 1);
+    store.controls.allocator_fault.store(3, SeqCst);
+    assert_eq!(restarted.allocate_producer_id().await.unwrap(), 2);
+    store.controls.allocator_fault.store(1, SeqCst);
+    assert!(restarted.allocate_producer_id().await.is_err());
+    assert_eq!(restarted.allocate_producer_id().await.unwrap(), 3);
 }

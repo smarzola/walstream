@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
         check_range(&events, offset, offset + 1).await?;
     }
     let root = read_json(store.as_ref(), &manifest(&args.store, "events")).await?;
-    ensure!(root["schema"] == 3 && root["tail"].as_array().unwrap().len() <= 64);
+    ensure!(root["schema"] == 4 && root["tail"].as_array().unwrap().len() <= 64);
     let root_len = serde_json::to_vec(&root)?.len();
     let page = Path::from(root["tree"]["object"].as_str().context("missing tree")?);
     let page_bytes = store.get(&page).await?.bytes().await?;
@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     check_range(&legacy, 0, 16).await?;
     ensure!(read_json(store.as_ref(), &legacy_path).await?["schema"] == 1);
     append(&legacy, 16).await?;
-    ensure!(read_json(store.as_ref(), &legacy_path).await?["schema"] == 3);
+    ensure!(read_json(store.as_ref(), &legacy_path).await?["schema"] == 4);
     for (path, bytes) in record_bytes {
         ensure!(
             store.get(&path).await?.bytes().await? == bytes,
@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
     let legacy = client(address, "legacy").await?;
     check_range(&legacy, 0, 17).await?;
     println!(
-        "legacy upgrade verified: schema 1 read unchanged, schema 3 append, original objects unchanged, replacement readback"
+        "legacy upgrade verified: schema 1 read unchanged, schema 4 append, original objects unchanged, replacement readback"
     );
     if let Some(baseline) = &args.baseline_broker {
         let (old, address) = start(&args.store, endpoint, baseline).await?;

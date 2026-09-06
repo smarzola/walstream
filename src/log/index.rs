@@ -6,7 +6,7 @@ use super::*;
 #[cfg(test)]
 mod tests;
 
-pub(super) const INDEX_SCHEMA: u32 = 3;
+pub(super) const INDEX_SCHEMA: u32 = 4;
 pub(super) const PAGE_ENTRIES: usize = 64;
 // 64^(10+1) exceeds the positive i64 offset space. A strict decreasing level
 // bounds traversal even if durable references are maliciously cyclic.
@@ -23,6 +23,8 @@ pub(super) struct Root {
     pub adopted_at_ms: Option<u64>,
     pub next_offset: i64,
     pub tree: Option<PageRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producers: Option<producer::ProducerRef>,
     #[serde(deserialize_with = "entries")]
     pub tail: Vec<Segment>,
 }
@@ -36,6 +38,7 @@ impl Default for Root {
             adopted_at_ms: Some(0),
             next_offset: 0,
             tree: None,
+            producers: None,
             tail: Vec::new(),
         }
     }
@@ -116,11 +119,12 @@ impl PageRef {
 
 impl Root {
     pub fn validate(&self, prefix: &str, topic: &str, partition: i32) -> Result<(), LogError> {
-        if !matches!(self.schema, 2 | INDEX_SCHEMA)
+        if !matches!(self.schema, 2 | 3 | INDEX_SCHEMA)
             || self.tail.len() > PAGE_ENTRIES
             || self.start_offset < 0
             || self.next_offset < self.start_offset
-            || (self.schema == INDEX_SCHEMA && self.adopted_at_ms.is_none())
+            || (self.schema >= 3 && self.adopted_at_ms.is_none())
+            || (self.schema < 4 && self.producers.is_some())
             || (self.schema == 2
                 && (self.start_offset != 0
                     || self.adopted_at_ms.is_some()
@@ -130,6 +134,9 @@ impl Root {
                         .any(|segment| segment.received_at_ms.is_some())))
         {
             return Err(invalid("unsupported or oversized index root"));
+        }
+        if let Some(producers) = &self.producers {
+            producers.validate(prefix, topic, partition)?;
         }
         let (start, count) = if let Some(tree) = &self.tree {
             tree.validate(prefix, topic, partition)?;

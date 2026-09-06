@@ -7,7 +7,7 @@
 //! state; no acknowledged record depends on local process state.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -34,6 +34,7 @@ use crate::codec::{MAX_BATCH_RECORDS, decode_record_batches, inspect_record_batc
 
 mod index;
 mod maintenance;
+pub(crate) mod producer;
 use index::{INDEX_SCHEMA, PAGE_ENTRIES, Root, Selection};
 pub use maintenance::{MaintenanceOptions, MaintenanceReport};
 
@@ -244,70 +245,69 @@ impl LogEngine {
         partition: i32,
         records: Vec<Record>,
     ) -> Result<AppendResult, LogError> {
+        self.append_batches(topic, partition, vec![records]).await
+    }
+
+    /// Append native batches atomically, preserving their producer identities.
+    pub(crate) async fn append_batches(
+        &self,
+        topic: &str,
+        partition: i32,
+        batches: Vec<Vec<Record>>,
+    ) -> Result<AppendResult, LogError> {
         validate_topic(topic)?;
         validate_partition(partition, MAX_TOPIC_PARTITIONS)?;
-        validate_records(&records)?;
-        if records.len() > MAX_BATCH_RECORDS {
+        if batches.is_empty() {
+            return Err(LogError::EmptyBatch);
+        }
+        let total: usize = batches.iter().map(Vec::len).sum();
+        if total > MAX_BATCH_RECORDS {
             return Err(LogError::TooManyRecords {
-                actual: records.len(),
+                actual: total,
                 maximum: MAX_BATCH_RECORDS,
             });
         }
-        validate_timestamp_span(&records)?;
+        let mut fingerprints = Vec::new();
+        let mut total_bytes = 0;
+        for records in &batches {
+            validate_records(records)?;
+            validate_timestamp_span(records)?;
+            let canonical = assigned_records(records, 0)?;
+            let encoded = encode_records(&canonical)?;
+            let inspection = inspect_record_batches(&encoded).map_err(|e| LogError::Codec {
+                detail: e.to_string(),
+            })?;
+            if inspection.batch_count != 1 || inspection.record_count != records.len() {
+                return Err(LogError::UnsupportedRecordSemantics);
+            }
+            total_bytes += encoded.len();
+            fingerprints.push(sha256_hex(&encoded));
+        }
+        if total_bytes > MAX_BATCH_BYTES {
+            return Err(LogError::BatchTooLarge {
+                actual: total_bytes,
+                maximum: MAX_BATCH_BYTES,
+            });
+        }
         let received_at_ms = unix_millis()?;
         self.ensure_topic(topic, partition).await?;
-
         for _ in 0..MAX_CAS_ATTEMPTS {
             let loaded = self
                 .load_manifest(topic, partition)
                 .await?
                 .unwrap_or_else(LoadedManifest::empty);
-            let base_offset = loaded.manifest.next_offset();
-            let mut assigned = records.clone();
-            for (delta, record) in assigned.iter_mut().enumerate() {
-                let delta_i32 = i32::try_from(delta).map_err(|_| LogError::OffsetOverflow)?;
-                record.offset = base_offset
-                    .checked_add(i64::try_from(delta).map_err(|_| LogError::OffsetOverflow)?)
-                    .ok_or(LogError::OffsetOverflow)?;
-                // A normal Kafka v2 batch derives per-record sequence values
-                // from the batch's -1 sentinel. Producer identity, not those
-                // derived values, determines whether idempotence is enabled.
-                record.sequence = NO_SEQUENCE.wrapping_add(delta_i32);
-                // Segment objects are one canonical batch. Incoming batch
-                // leader epochs have no meaning in this single virtual broker.
-                record.partition_leader_epoch = -1;
-            }
-
-            validate_timestamp_span(&assigned)?;
-            let encoded = encode_records(&assigned)?;
-            if encoded.len() > MAX_BATCH_BYTES {
-                return Err(LogError::BatchTooLarge {
-                    actual: encoded.len(),
-                    maximum: MAX_BATCH_BYTES,
-                });
-            }
-            let inspection =
-                inspect_record_batches(&encoded).map_err(|source| LogError::Codec {
-                    detail: source.to_string(),
-                })?;
-            if inspection.batch_count != 1 || inspection.record_count != assigned.len() {
-                return Err(LogError::Codec {
-                    detail: "canonical segment did not encode as exactly one batch".into(),
-                });
-            }
-
-            let object = self.segment_path(topic, partition, Uuid::new_v4());
-            let checksum = sha256_hex(&encoded);
-            let record_count =
-                i64::try_from(assigned.len()).map_err(|_| LogError::OffsetOverflow)?;
-            let next_offset = base_offset
-                .checked_add(record_count)
-                .ok_or(LogError::OffsetOverflow)?;
-            let mut next = match self
-                .append_root(topic, partition, loaded.manifest, received_at_ms)
-                .await
-            {
-                Ok(root) => root,
+            let prepared = self
+                .prepare_append(
+                    topic,
+                    partition,
+                    loaded.manifest,
+                    &batches,
+                    &fingerprints,
+                    received_at_ms,
+                )
+                .await;
+            let (result, next) = match prepared {
+                Ok(prepared) => prepared,
                 Err(error) => {
                     if self
                         .stale_missing(topic, partition, &loaded.version, &error)
@@ -318,22 +318,10 @@ impl LogEngine {
                     return Err(error);
                 }
             };
-            next.revision = next
-                .revision
-                .checked_add(1)
-                .ok_or(LogError::RevisionOverflow)?;
-            next.next_offset = next_offset;
-            next.tail.push(Segment {
-                object: object.to_string(),
-                base_offset,
-                record_count: u32::try_from(assigned.len())
-                    .map_err(|_| LogError::OffsetOverflow)?,
-                byte_length: encoded.len() as u64,
-                sha256: checksum,
-                received_at_ms: Some(received_at_ms),
-            });
+            let Some(next) = next else {
+                return Ok(result);
+            };
             next.validate(&self.prefix, topic, partition)?;
-
             let bytes = Bytes::from(serde_json::to_vec(&next)?);
             if bytes.len() > MAX_MANIFEST_BYTES {
                 return Err(LogError::ManifestTooLarge {
@@ -341,9 +329,6 @@ impl LogEngine {
                     maximum: MAX_MANIFEST_BYTES,
                 });
             }
-            self.store
-                .put_opts(&object, encoded.clone().into(), PutMode::Create.into())
-                .await?;
             let mode = loaded.version.map_or(PutMode::Create, PutMode::Update);
             match self
                 .store
@@ -354,24 +339,124 @@ impl LogEngine {
                 )
                 .await
             {
-                Ok(_) => {
-                    return Ok(AppendResult {
-                        base_offset,
-                        last_offset: next_offset - 1,
-                    });
-                }
-                Err(StoreError::Precondition { .. } | StoreError::AlreadyExists { .. }) => {
-                    // The segment is an unreferenced immutable orphan. It is
-                    // intentionally invisible and can be collected later.
-                    continue;
-                }
+                Ok(_) => return Ok(result),
+                Err(StoreError::Precondition { .. } | StoreError::AlreadyExists { .. }) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
-
         Err(LogError::ContentionExhausted {
             attempts: MAX_CAS_ATTEMPTS,
         })
+    }
+
+    async fn prepare_append(
+        &self,
+        topic: &str,
+        partition: i32,
+        manifest: LogManifest,
+        batches: &[Vec<Record>],
+        fingerprints: &[String],
+        received_at_ms: u64,
+    ) -> Result<(AppendResult, Option<Root>), LogError> {
+        let initial_offset = manifest.next_offset();
+        let mut next_offset = initial_offset;
+        let directory = match &manifest {
+            LogManifest::Indexed(root) => root.producers.as_ref(),
+            _ => None,
+        };
+        let mut states = BTreeMap::new();
+        let mut additions = Vec::new();
+        let mut results = Vec::new();
+        // Decide the complete request without publishing tentative objects.
+        for (records, fingerprint) in batches.iter().zip(fingerprints) {
+            let first = &records[0];
+            let count = records.len() as u32;
+            let result = if first.producer_id >= 0 {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    states.entry(first.producer_id)
+                {
+                    let state = self
+                        .producer_state(
+                            topic,
+                            partition,
+                            directory,
+                            first.producer_id,
+                            initial_offset,
+                        )
+                        .await?
+                        .unwrap_or_else(|| {
+                            producer::ProducerState::new(first.producer_id, first.producer_epoch)
+                        });
+                    entry.insert(state);
+                }
+                states.get_mut(&first.producer_id).unwrap().accept(
+                    first.producer_epoch,
+                    first.sequence,
+                    count,
+                    fingerprint,
+                    next_offset,
+                )?
+            } else {
+                AppendResult {
+                    base_offset: next_offset,
+                    last_offset: next_offset
+                        .checked_add(i64::from(count))
+                        .ok_or(LogError::OffsetOverflow)?
+                        - 1,
+                }
+            };
+            if result.base_offset == next_offset {
+                additions.push((records, result.base_offset));
+                next_offset = result.last_offset + 1;
+            }
+            results.push(result);
+        }
+        let result = AppendResult {
+            base_offset: results[0].base_offset,
+            last_offset: results.last().unwrap().last_offset,
+        };
+        if additions.is_empty() {
+            return Ok((result, None));
+        }
+        let mut root = self
+            .append_root(topic, partition, manifest, received_at_ms)
+            .await?;
+        for (records, base_offset) in additions {
+            if root.tail.len() == PAGE_ENTRIES {
+                self.seal_tail(topic, partition, &mut root).await?;
+            }
+            let encoded = encode_records(&assigned_records(records, base_offset)?)?;
+            let object = self.segment_path(topic, partition, Uuid::new_v4());
+            root.revision = root
+                .revision
+                .checked_add(1)
+                .ok_or(LogError::RevisionOverflow)?;
+            root.next_offset = base_offset + records.len() as i64;
+            root.tail.push(Segment {
+                object: object.to_string(),
+                base_offset,
+                record_count: records.len() as u32,
+                byte_length: encoded.len() as u64,
+                sha256: sha256_hex(&encoded),
+                received_at_ms: Some(received_at_ms),
+            });
+            self.store
+                .put_opts(&object, encoded.into(), PutMode::Create.into())
+                .await?;
+        }
+        for state in states.into_values() {
+            root.producers = Some(
+                self.update_producer(
+                    topic,
+                    partition,
+                    root.producers.as_ref(),
+                    state,
+                    next_offset,
+                )
+                .await?,
+            );
+        }
+        Ok((result, Some(root)))
     }
 
     /// Fetch all committed records beginning at an inclusive offset.
@@ -526,7 +611,7 @@ impl LogEngine {
             LogManifest::Indexed(mut root) => {
                 if root.schema != INDEX_SCHEMA {
                     root.schema = INDEX_SCHEMA;
-                    root.adopted_at_ms = Some(now_ms);
+                    root.adopted_at_ms.get_or_insert(now_ms);
                 }
                 root
             }
@@ -747,7 +832,7 @@ impl LogEngine {
                         legacy.validate(&self.prefix, topic, partition)?;
                         LogManifest::Legacy(legacy)
                     }
-                    2 | INDEX_SCHEMA => {
+                    2 | 3 | INDEX_SCHEMA => {
                         let root: Root = serde_json::from_slice(&bytes).map_err(|e| {
                             LogError::InvalidManifest {
                                 detail: e.to_string(),
@@ -1044,8 +1129,17 @@ pub enum LogError {
     #[error("append batch must contain at least one record")]
     EmptyBatch,
     /// Record metadata requires unsupported Kafka semantics.
-    #[error("idempotent, transactional, and control records are unsupported in the MVP")]
+    #[error("invalid producer identity or unsupported transactional/control record semantics")]
     UnsupportedRecordSemantics,
+    /// A batch does not continue the committed producer sequence.
+    #[error("out of order producer sequence")]
+    OutOfOrderSequence,
+    /// A lower epoch was fenced by a committed newer epoch.
+    #[error("invalid producer epoch")]
+    InvalidProducerEpoch,
+    /// A retry reused a sequence with different content or boundaries.
+    #[error("conflicting producer sequence")]
+    ConflictingSequence,
     /// Fetch offset was negative.
     #[error("offset {offset} must not be negative")]
     InvalidOffset { offset: i64 },
@@ -1169,12 +1263,38 @@ fn validate_records(records: &[Record]) -> Result<(), LogError> {
         record.transactional
             || record.control
             || record.delete_horizon
-            || record.producer_id != NO_PRODUCER_ID
-            || record.producer_epoch != NO_PRODUCER_EPOCH
+            || (record.producer_id == NO_PRODUCER_ID && record.producer_epoch != NO_PRODUCER_EPOCH)
+            || record.producer_id < NO_PRODUCER_ID
+            || (record.producer_id >= 0 && record.producer_epoch < 0)
     }) {
         return Err(LogError::UnsupportedRecordSemantics);
     }
+    let first = &records[0];
+    if first.producer_id >= 0
+        && (first.sequence < 0
+            || records.iter().enumerate().any(|(delta, r)| {
+                r.producer_id != first.producer_id
+                    || r.producer_epoch != first.producer_epoch
+                    || r.sequence != first.sequence.wrapping_add(delta as i32)
+            }))
+    {
+        return Err(LogError::UnsupportedRecordSemantics);
+    }
     Ok(())
+}
+
+fn assigned_records(records: &[Record], base_offset: i64) -> Result<Vec<Record>, LogError> {
+    let mut assigned = records.to_vec();
+    for (delta, record) in assigned.iter_mut().enumerate() {
+        record.offset = base_offset
+            .checked_add(delta as i64)
+            .ok_or(LogError::OffsetOverflow)?;
+        if record.producer_id == NO_PRODUCER_ID {
+            record.sequence = NO_SEQUENCE.wrapping_add(delta as i32);
+        }
+        record.partition_leader_epoch = -1;
+    }
+    Ok(assigned)
 }
 
 fn validate_timestamp_span(records: &[Record]) -> Result<(), LogError> {
@@ -1233,9 +1353,15 @@ fn validate_canonical_segment_records(
     })?;
     if records.iter().enumerate().any(|(delta, record)| {
         record.partition_leader_epoch != -1
-            || i32::try_from(delta)
-                .ok()
-                .is_none_or(|delta| record.sequence != NO_SEQUENCE.wrapping_add(delta))
+            || i32::try_from(delta).ok().is_none_or(|delta| {
+                record.sequence
+                    != (if records[0].producer_id >= 0 {
+                        records[0].sequence
+                    } else {
+                        NO_SEQUENCE
+                    })
+                    .wrapping_add(delta)
+            })
     }) {
         return Err(LogError::CorruptSegment {
             object: segment.object.clone(),
@@ -2051,7 +2177,7 @@ mod tests {
 
         let mut idempotent = record("a");
         idempotent.producer_id = 7;
-        idempotent.producer_epoch = 1;
+        idempotent.producer_epoch = -1;
         idempotent.sequence = 0;
         assert!(matches!(
             engine.append("events", 0, vec![idempotent]).await,
