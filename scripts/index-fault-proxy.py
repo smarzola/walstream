@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposable HTTP S3 proxy: hold a selected root PUT before publication."""
+"""Disposable loopback S3 proxy with a single observable request barrier."""
 import argparse
 import http.client
 import http.server
@@ -12,10 +12,16 @@ parser.add_argument("--listen", required=True)
 parser.add_argument("--upstream", required=True)
 parser.add_argument("--marker", required=True)
 parser.add_argument("--suffix", required=True)
+parser.add_argument("--method", default="PUT", choices=["PUT", "GET", "HEAD", "DELETE", "POST"])
+parser.add_argument("--release", help="resume forwarding once this file exists")
+parser.add_argument("--skip", type=int, default=0, help="matching requests to forward before pausing")
 args = parser.parse_args()
 upstream = urlsplit(args.upstream)
 assert upstream.scheme == "http", "development HTTP endpoints only"
 host, port = args.listen.rsplit(":", 1)
+lock = threading.Lock()
+remaining = args.skip
+intercepted = False
 assert host == "127.0.0.1", "loopback only"
 
 
@@ -26,16 +32,29 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         pass
 
     def forward(self):
+        global remaining, intercepted
         # object_store supplies fixed-length request bodies. Reject an unknown
         # framing mode rather than silently forwarding a partial signed body.
         if self.headers.get("Transfer-Encoding"):
             self.send_error(501, "chunked requests unsupported in fault probe")
             return
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        if self.command == "PUT" and urlsplit(self.path).path.endswith(args.suffix):
-            Path(args.marker).write_text("root PUT body received; not forwarded\n")
-            threading.Event().wait()  # harness kills this owned proxy
-            return
+        hold = False
+        with lock:
+            if not intercepted and self.command == args.method and urlsplit(self.path).path.endswith(args.suffix):
+                if remaining:
+                    remaining -= 1
+                else:
+                    intercepted = True
+                    hold = True
+        if hold:
+            Path(args.marker).write_text(f"{self.command} {self.path}; body received, not forwarded\n")
+            if args.release:
+                while not Path(args.release).exists():
+                    threading.Event().wait(0.01)
+            else:
+                threading.Event().wait()  # harness kills this owned proxy
+                return
         connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=30)
         try:
             # Preserve the signed Host header while connecting to the backend.
@@ -46,7 +65,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             for name, value in response.getheaders():
                 if name.lower() not in {"transfer-encoding", "content-length", "connection"}:
                     self.send_header(name, value)
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Length", response.getheader("Content-Length", "0") if self.command == "HEAD" else str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
         finally:

@@ -9,6 +9,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -32,7 +33,9 @@ use uuid::Uuid;
 use crate::codec::{MAX_BATCH_RECORDS, decode_record_batches, inspect_record_batches};
 
 mod index;
+mod maintenance;
 use index::{INDEX_SCHEMA, PAGE_ENTRIES, Root, Selection};
+pub use maintenance::{MaintenanceOptions, MaintenanceReport};
 
 const MANIFEST_SCHEMA: u32 = 1;
 const MAX_CAS_ATTEMPTS: usize = 128;
@@ -251,6 +254,7 @@ impl LogEngine {
             });
         }
         validate_timestamp_span(&records)?;
+        let received_at_ms = unix_millis()?;
         self.ensure_topic(topic, partition).await?;
 
         for _ in 0..MAX_CAS_ATTEMPTS {
@@ -299,15 +303,21 @@ impl LogEngine {
             let next_offset = base_offset
                 .checked_add(record_count)
                 .ok_or(LogError::OffsetOverflow)?;
-            let mut next = match loaded.manifest {
-                LogManifest::Legacy(legacy) => {
-                    self.migrate_manifest(topic, partition, legacy).await?
+            let mut next = match self
+                .append_root(topic, partition, loaded.manifest, received_at_ms)
+                .await
+            {
+                Ok(root) => root,
+                Err(error) => {
+                    if self
+                        .stale_missing(topic, partition, &loaded.version, &error)
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                LogManifest::Indexed(root) => root,
             };
-            if next.tail.len() == PAGE_ENTRIES {
-                self.seal_tail(topic, partition, &mut next).await?;
-            }
             next.revision = next
                 .revision
                 .checked_add(1)
@@ -320,6 +330,7 @@ impl LogEngine {
                     .map_err(|_| LogError::OffsetOverflow)?,
                 byte_length: encoded.len() as u64,
                 sha256: checksum,
+                received_at_ms: Some(received_at_ms),
             });
             next.validate(&self.prefix, topic, partition)?;
 
@@ -415,12 +426,49 @@ impl LogEngine {
             return Err(LogError::InvalidOffset { offset });
         }
 
-        let loaded = self
-            .load_manifest(topic, partition)
-            .await?
-            .unwrap_or_else(LoadedManifest::empty);
-        let high_watermark = loaded.manifest.next_offset();
-        if offset > high_watermark {
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let loaded = self
+                .load_manifest(topic, partition)
+                .await?
+                .unwrap_or_else(LoadedManifest::empty);
+            match self
+                .fetch_snapshot(
+                    topic,
+                    partition,
+                    loaded.manifest,
+                    offset,
+                    maximum_bytes,
+                    allow_oversized_first_batch,
+                )
+                .await
+            {
+                Ok(fetched) => return Ok(fetched),
+                Err(error) => {
+                    if !self
+                        .stale_missing(topic, partition, &loaded.version, &error)
+                        .await?
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Err(LogError::ContentionExhausted {
+            attempts: MAX_CAS_ATTEMPTS,
+        })
+    }
+
+    async fn fetch_snapshot(
+        &self,
+        topic: &str,
+        partition: i32,
+        manifest: LogManifest,
+        offset: i64,
+        maximum_bytes: usize,
+        allow_oversized_first_batch: bool,
+    ) -> Result<BoundedFetch, LogError> {
+        let high_watermark = manifest.next_offset();
+        if offset < manifest.start_offset() || offset > high_watermark {
             return Err(LogError::OffsetOutOfRange {
                 offset,
                 latest: high_watermark,
@@ -435,7 +483,7 @@ impl LogEngine {
         }
 
         let mut selection = Selection::new(offset, maximum_bytes, allow_oversized_first_batch);
-        match loaded.manifest {
+        match manifest {
             LogManifest::Legacy(manifest) => {
                 for segment in manifest.segments {
                     if !selection.push(segment)? {
@@ -461,6 +509,56 @@ impl LogEngine {
             high_watermark,
             oversized_first_batch: selection.oversized_first_batch,
         })
+    }
+
+    async fn append_root(
+        &self,
+        topic: &str,
+        partition: i32,
+        manifest: LogManifest,
+        now_ms: u64,
+    ) -> Result<Root, LogError> {
+        let mut root = match manifest {
+            LogManifest::Legacy(legacy) => {
+                self.migrate_manifest(topic, partition, legacy, now_ms)
+                    .await?
+            }
+            LogManifest::Indexed(mut root) => {
+                if root.schema != INDEX_SCHEMA {
+                    root.schema = INDEX_SCHEMA;
+                    root.adopted_at_ms = Some(now_ms);
+                }
+                root
+            }
+        };
+        if root.tail.len() == PAGE_ENTRIES {
+            self.seal_tail(topic, partition, &mut root).await?;
+        }
+        Ok(root)
+    }
+
+    async fn stale_missing(
+        &self,
+        topic: &str,
+        partition: i32,
+        version: &Option<UpdateVersion>,
+        error: &LogError,
+    ) -> Result<bool, LogError> {
+        if !matches!(
+            error,
+            LogError::ObjectStore(StoreError::NotFound { .. })
+                | LogError::MissingSegment {
+                    source: StoreError::NotFound { .. },
+                    ..
+                }
+        ) {
+            return Ok(false);
+        }
+        let current = self
+            .load_manifest(topic, partition)
+            .await?
+            .and_then(|loaded| loaded.version);
+        Ok(&current != version)
     }
 
     async fn read_segment(&self, segment: &Segment) -> Result<Bytes, LogError> {
@@ -545,7 +643,7 @@ impl LogEngine {
             .unwrap_or_else(LoadedManifest::empty)
             .manifest;
         Ok(OffsetRange {
-            earliest: 0,
+            earliest: manifest.start_offset(),
             latest: manifest.next_offset(),
         })
     }
@@ -649,7 +747,7 @@ impl LogEngine {
                         legacy.validate(&self.prefix, topic, partition)?;
                         LogManifest::Legacy(legacy)
                     }
-                    INDEX_SCHEMA => {
+                    2 | INDEX_SCHEMA => {
                         let root: Root = serde_json::from_slice(&bytes).map_err(|e| {
                             LogError::InvalidManifest {
                                 detail: e.to_string(),
@@ -861,6 +959,8 @@ struct Segment {
     record_count: u32,
     byte_length: u64,
     sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    received_at_ms: Option<u64>,
 }
 
 impl Segment {
@@ -879,6 +979,13 @@ enum LogManifest {
 }
 
 impl LogManifest {
+    fn start_offset(&self) -> i64 {
+        match self {
+            Self::Legacy(_) => 0,
+            Self::Indexed(root) => root.start_offset,
+        }
+    }
+
     fn next_offset(&self) -> i64 {
         match self {
             Self::Legacy(m) => m.next_offset,
@@ -942,8 +1049,8 @@ pub enum LogError {
     /// Fetch offset was negative.
     #[error("offset {offset} must not be negative")]
     InvalidOffset { offset: i64 },
-    /// Fetch offset is beyond the partition high watermark.
-    #[error("offset {offset} is beyond latest offset {latest}")]
+    /// Fetch offset is outside the retained range.
+    #[error("offset {offset} is outside the retained range ending at {latest}")]
     OffsetOutOfRange { offset: i64, latest: i64 },
     /// Encoded batch exceeded the bounded request size.
     #[error("encoded batch is {actual} bytes; maximum is {maximum}")]
@@ -981,9 +1088,31 @@ pub enum LogError {
     /// Object-store operation failure.
     #[error("object store operation failed")]
     ObjectStore(#[from] StoreError),
+    /// Invalid maintenance input, rejected before storage operations.
+    #[error("invalid maintenance options: {detail}")]
+    InvalidMaintenance { detail: String },
+    /// An inventory or complete graph exceeded its configured bound.
+    #[error("maintenance scan exceeds {maximum} objects")]
+    MaintenanceBudget { maximum: usize },
+    /// Publication may have completed; inspect the report before retrying.
+    #[error("maintenance incomplete: {source}")]
+    MaintenanceIncomplete {
+        report: Box<MaintenanceReport>,
+        source: Box<LogError>,
+    },
     /// Repeated concurrent commits did not converge.
     #[error("manifest contention did not converge after {attempts} attempts")]
     ContentionExhausted { attempts: usize },
+}
+
+fn unix_millis() -> Result<u64, LogError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .ok_or_else(|| LogError::InvalidManifest {
+            detail: "broker clock is outside the supported Unix millisecond range".into(),
+        })
 }
 
 fn validate_prefix(prefix: &str) -> Result<(), LogError> {
@@ -1535,6 +1664,7 @@ mod tests {
                 record_count: 1,
                 byte_length: legacy_batch.len() as u64,
                 sha256: sha256_hex(&legacy_batch),
+                received_at_ms: None,
             }],
         };
         let legacy_manifest = Bytes::from(serde_json::to_vec(&legacy_manifest).unwrap());
@@ -1733,6 +1863,7 @@ mod tests {
                     record_count,
                     byte_length,
                     sha256: "0".repeat(64),
+                    received_at_ms: None,
                 }],
             };
             engine

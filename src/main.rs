@@ -8,7 +8,10 @@ use tracing_subscriber::EnvFilter;
 use walstream::config::S3Settings;
 use walstream::coordinator::GroupCoordinator;
 use walstream::group::GroupStore;
-use walstream::log::{DEFAULT_TOPIC_PARTITIONS, LogEngine, MAX_TOPIC_PARTITIONS};
+use walstream::log::{
+    DEFAULT_TOPIC_PARTITIONS, LogEngine, LogError, MAX_TOPIC_PARTITIONS, MaintenanceOptions,
+    MaintenanceReport,
+};
 use walstream::protocol::BrokerIdentity;
 use walstream::server::{DEFAULT_MAX_FRAME_BYTES, serve, validate_max_frame_bytes};
 use walstream::storage::{build_s3_store, verify_store_contract};
@@ -27,6 +30,45 @@ enum Command {
 
     /// Validate object-store configuration and connectivity.
     VerifyStore(S3Settings),
+
+    /// Preview or apply retention and garbage collection for one partition.
+    Maintain(MaintainSettings),
+}
+
+#[derive(Debug, Args)]
+struct MaintainSettings {
+    #[command(flatten)]
+    s3: S3Settings,
+    /// Existing topic to maintain.
+    #[arg(long)]
+    topic: String,
+    /// Explicit partition number.
+    #[arg(long)]
+    partition: i32,
+    /// Expire oldest whole batches received at least this many milliseconds ago.
+    #[arg(long)]
+    max_age_ms: Option<u64>,
+    /// Retain at most this many bytes of encoded record objects.
+    #[arg(long)]
+    max_bytes: Option<u64>,
+    /// Publish retention and delete unreachable objects; default is preview.
+    #[arg(long)]
+    apply: bool,
+    /// Bound listed entries and each live graph (1..=1000000).
+    #[arg(long, default_value_t = 100_000)]
+    max_objects: usize,
+    /// Emit a structured report instead of human-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
+fn print_maintenance(report: &MaintenanceReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        print!("{report}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Args)]
@@ -123,6 +165,29 @@ async fn main() -> Result<()> {
                 },
             )
             .await?;
+        }
+        Command::Maintain(settings) => {
+            let options = MaintenanceOptions {
+                max_age_ms: settings.max_age_ms,
+                max_bytes: settings.max_bytes,
+                apply: settings.apply,
+                max_objects: settings.max_objects,
+            };
+            options.validate()?;
+            // Do not run verify-store here: preview must perform zero writes.
+            let store = build_s3_store(&settings.s3)?;
+            let engine = LogEngine::new(store, settings.s3.cluster_prefix())?;
+            match engine
+                .maintain(&settings.topic, settings.partition, &options)
+                .await
+            {
+                Ok(report) => print_maintenance(&report, settings.json)?,
+                Err(LogError::MaintenanceIncomplete { report, source }) => {
+                    print_maintenance(&report, settings.json)?;
+                    return Err(source).context("maintenance incomplete; inspect publication and collection progress before retrying");
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         Command::VerifyStore(settings) => {
             let store = build_s3_store(&settings)?;

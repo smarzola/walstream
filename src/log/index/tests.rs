@@ -142,6 +142,7 @@ async fn legacy(engine: &LogEngine, count: usize) -> Manifest {
             record_count: 1,
             byte_length: bytes.len() as u64,
             sha256: sha256_hex(&bytes),
+            received_at_ms: None,
         });
     }
     manifest.next_offset = count as i64;

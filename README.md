@@ -90,13 +90,39 @@ Objects live under:
 
 Topic metadata is schema-versioned and conditionally created. Existing installations that have a valid partition-0 manifest but no topic metadata are read as one-partition topics and upgraded without rewriting their log.
 
-New partition manifests use schema 2: a root with at most 64 active segment descriptors and a reference to an immutable offset index. Sealed leaves contain 64 descriptors, branches contain at most 64 child references, and each metadata body retains the 4 MiB safety cap. The index supports up to 11 page levels, covering the positive Kafka offset space. Appends update the bounded root and, on rollover, the rightmost index path. Fetch locates requested offsets through the index; it does not load the full partition history. There is no longer a 10,000-append limit.
+New partition manifests use schema 3: a root with at most 64 active segment descriptors and a reference to an immutable offset index. Sealed leaves contain 64 descriptors, branches contain at most 64 child references, and each metadata body retains the 4 MiB safety cap. The index supports up to 11 page levels, covering the positive Kafka offset space. Appends update the bounded root and, on rollover, the rightmost index path. Fetch locates requested offsets through the index; it does not load the full partition history. There is no longer a 10,000-append limit.
 
-Schema-1 partition manifests remain readable. Their next successful append atomically publishes schema 2 using existing record objects and offsets. Reads alone do not convert the partition manifest. **Older Walstream binaries cannot serve an upgraded partition.** Stop old processes before upgrading; mixed-version operation and downgrade after conversion are unsupported. No record objects are deleted, and orphan or superseded index pages remain stored until a future collection implementation.
+Schema-1 flat manifests and schema-2 index roots remain readable. Their next successful append or maintenance apply publishes schema 3 using existing record objects and offsets. Reads and maintenance previews do not convert the partition manifest. Schema 3 adds the earliest retained offset, broker receive times, and a publication revision that advances even when no records are appended. **Older Walstream binaries cannot serve an upgraded partition.** Stop old processes before upgrading; mixed-version operation and downgrade after conversion are unsupported.
 
 Committed group offsets and optional metadata use a bounded, schema-versioned object with the same conditional-create/ETag-update discipline. They survive complete broker replacement. Membership, generations, assignments, heartbeats, and session deadlines exist only in the broker process, so retained consumers must rediscover the coordinator and rejoin with new member identities after replacement. Join, leave, and session expiry rebalance only the affected group; the leader receives every member's selected-protocol metadata and must submit exactly one immutable assignment per member for the new generation.
 
 See [docs/architecture.md](docs/architecture.md) for the failure model and invariants.
+
+## Retain data and reclaim storage
+
+Retention is explicit: the broker keeps data until you run `maintain --apply`. First verify the store contract as shown above. Maintenance also needs ListBucket access to the selected partition's `segments/` and `index/` prefixes and DeleteObject access to their contents. It does not create topics.
+
+Preview a partition with a one-day age limit and a 1 GiB encoded-record limit:
+
+```bash
+./target/release/walstream maintain \
+  --bucket my-walstream-bucket --region eu-north-1 \
+  --prefix walstream --cluster-id production \
+  --topic events --partition 0 \
+  --max-age-ms 86400000 --max-bytes 1073741824
+```
+
+The report shows the previous and proposed readable offsets, retained/expired batches and bytes, collectible objects, and any format adoption. Preview performs no writes or deletes. Repeat the command with `--apply` to publish retention and collect objects. Omit both limits to collect only unreachable objects. Add `--json` for a structured report.
+
+Both limits remove the oldest contiguous prefix of **whole batches**. Age uses the time the broker received the batch, independently of producer timestamps. Batches without a stored receive time use the partition's persisted schema-3 adoption time, giving existing data a full age window after upgrade. A byte limit can expire that data immediately. Byte limits count encoded record objects; they exclude index overhead, orphan objects, and historical bucket versions. Limits apply when maintenance runs; they do not cap later appends.
+
+A batch larger than the byte limit can expire completely. Zero age or zero bytes can expire all records. If offsets 0–99 expire, the earliest offset becomes 100 and requests for an expired offset receive `OFFSET_OUT_OF_RANGE`. Retained offsets never change, and even an empty log keeps its next append offset across process replacement. Committed consumer offsets remain unchanged; retention does not wait for slow consumers.
+
+Maintenance runs alongside readers and writers. It inventories candidates, conditionally publishes the retained range, validates the complete committed metadata graph and record-object lengths, and then deletes proven unreachable candidates. Missing objects from a superseded snapshot cause a bounded retry. Corruption and missing objects from an unchanged root fail the operation. Fetch continues to validate record contents and checksums; maintenance is not a full record-body integrity audit.
+
+If maintenance exits unsuccessfully after publication, its report identifies the committed range and completed collection count. An uncertain publication response authorizes no deletion. Rerunning is safe: a committed range remains in effect and a later pass collects remaining objects. A listing that misses a candidate leaves it for a later pass. Collection counts include already absent candidates; collected byte counts use their inventory sizes. Ordinary deletion does not purge noncurrent versions in a versioned bucket.
+
+`--max-objects` defaults to 100,000 and accepts 1–1,000,000. It bounds listed entries and each complete live graph; exceeding an inventory/planning bound prevents publication. A failure during validation after publication prevents deletion and reports the committed state. Operations retry stale snapshots or failed conditions at most 128 times. Under sustained interference, maintenance can return a contention error; previously committed retention remains effective.
 
 ## Verify it
 
@@ -139,11 +165,19 @@ The index walkthrough launches the actual broker against its own disposable Rust
 
 It requires Python 3 for the local fault proxy in addition to the existing container tools. `--appends 129` runs a short rollover smoke walkthrough. `--baseline-broker /path/to/old/walstream` also exercises rejection of an upgraded partition by an actual older binary. This is a correctness walkthrough, not a throughput benchmark.
 
+The maintenance walkthrough exercises the actual CLI and Kafka service, including preview, repeated trimming, storage reclamation, empty-log replacement, paused readers/writers, interrupted deletion, legacy adoption, and corrupt-metadata rejection:
+
+```bash
+./scripts/test-maintenance.sh
+```
+
+It uses an owned disposable RustFS container and the same Python fault proxy. An optional `--baseline-broker /path/to/schema-2/walstream` proves old-binary rejection after schema-3 adoption.
+
 ## Explicit non-goals
 
 - static membership, the newer consumer group protocol, offset retention, transactions, and idempotent producers;
 - more than one broker, replication-factor semantics, or follower reads;
-- retention, compaction, orphan collection, quotas, or multi-region operation;
+- automatic retention scheduling, compaction, quotas, or multi-region operation;
 - Kafka authentication/authorization or TLS termination;
 - compressed record batches or duplicate Kafka header keys;
 - throughput comparable to Kafka: every append uploads an object and contends on one per-partition manifest CAS.

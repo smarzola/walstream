@@ -260,5 +260,69 @@ async fn binary_recovers_from_s3_and_serializes_independent_writers() {
             Some(format!("indexed-{}", entry.offset).as_bytes())
         );
     }
+    // Exercise the actual maintenance CLI against each supported backend.
+    let maintenance = |extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_walstream"))
+            .args(store_args("maintain", &bucket, &endpoint, &prefix, cluster))
+            .args(["--topic", "events", "--partition", "0", "--json"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let preview = maintenance(&["--max-bytes", "4096"]);
+    assert_eq!(indexed.get_offset(OffsetAt::Earliest).await.unwrap(), 0);
+    let report = maintenance(&["--max-bytes", "4096", "--apply"]);
+    assert_eq!(preview["start_offset"], report["start_offset"]);
+    let retained_start = report["start_offset"].as_i64().unwrap();
+    assert!(retained_start > 0 && retained_start < 131);
+    assert_eq!(
+        indexed.get_offset(OffsetAt::Earliest).await.unwrap(),
+        retained_start
+    );
+    let (retained, end) = indexed
+        .fetch_records(retained_start, 1..1_000_000, 1000)
+        .await
+        .unwrap();
+    assert_eq!(end, 131);
+    assert_eq!(retained, records[retained_start as usize..]);
+    assert!(report["collected_objects"].as_u64().unwrap() > 0);
+    let empty = maintenance(&["--max-bytes", "0", "--apply"]);
+    assert_eq!(empty["start_offset"], 131);
+    println!("maintenance retained start={retained_start}, then expired all records: {empty}");
     third.stop();
+    let fourth = BrokerProcess::start(&bucket, &endpoint, &prefix, cluster).await;
+    let client = ClientBuilder::new(vec![fourth.address.to_string()])
+        .build()
+        .await
+        .unwrap();
+    let empty = client
+        .partition_client("events", 0, UnknownTopicHandling::Error)
+        .await
+        .unwrap();
+    assert_eq!(empty.get_offset(OffsetAt::Earliest).await.unwrap(), 131);
+    assert_eq!(empty.get_offset(OffsetAt::Latest).await.unwrap(), 131);
+    assert_eq!(
+        empty
+            .produce(
+                vec![record("after-retention", 6000)],
+                Compression::NoCompression
+            )
+            .await
+            .unwrap(),
+        vec![131]
+    );
+    assert_eq!(
+        empty.fetch_records(131, 1..1000, 1000).await.unwrap().0[0]
+            .record
+            .value
+            .as_deref(),
+        Some(b"after-retention".as_slice())
+    );
+    fourth.stop();
 }
