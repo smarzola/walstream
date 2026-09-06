@@ -4,7 +4,7 @@ Repository: `/Users/smarzola/projects/walstream`
 Source of truth: this contract and the request to pursue the next milestone after PR #4.
 Revision: 1, prepared 2026-09-06.
 Approval: **Approved** revision 1 on 2026-09-06. The user replied “Approved” to the concrete retention and garbage collection plan and its defaults.
-Execution: implementation and implementer verification complete; independent final review and PR readiness pending.
+Execution: complete; implementation, both runtime walkthroughs, independent final review, and PR readiness verified.
 Goal-file commit policy: **Commit after approval.** `git ls-files docs/goals` and merged history show two comparable committed goal contracts, including `scalable-partition-log-metadata.md` in PR #4.
 PR delivery: GitHub `smarzola/walstream`, base `main`, proposed branch `feat/retention-garbage-collection`. Open a draft after approval and keep it draft through implementation and independent review; finish with a verified ready PR.
 
@@ -100,7 +100,7 @@ Starting branch/base: `main` at `c0647b9748b8b1d641aab7b9026f242cf4d01ad3`.
 
 - [x] Retained-range metadata, age semantics, migration, and stale-snapshot retry behavior verified.
 - [x] Preview/apply maintenance and deletion/failure invariants verified, including measured storage cleanup.
-- [ ] Full runtime/regression evidence, independent final review, and ready PR completed.
+- [x] Full runtime/regression evidence, independent final review, and ready PR completed.
 
 Commit and push coherent verified milestones, recording concise evidence and material choices. Reuse valid evidence until a code/input/environment change or finding invalidates it; do not rerun passing checks merely at a checkpoint boundary.
 
@@ -147,9 +147,11 @@ The 25,000-append regression passed, including complete replacement readback, un
 RustFS, SeaweedFS, and MinIO each passed conditional writes, independent writers, index rollover/recovery, preview/apply retention, complete expiry, and append after empty-log replacement. Evidence: `/tmp/walstream-retention-s3-{rustfs,seaweedfs,minio}.log`. Pinned librdkafka 2.12.1 and Apache Kafka Java 4.2.0 passed retained-survivor recovery across broker replacement: `/tmp/walstream-retention-client-recovery.log`.
 
 Implementation decisions: schema 3 uses a monotonically increasing publication revision, separate retained start, optional per-batch receive times, and a persisted adoption time. Maintenance builds replacement index pages from the retained descriptors without rewriting records. Defaults are 100,000 objects per inventory/live graph, hard maximum 1,000,000, and 128 attempts. It validates complete index metadata and record existence/length; record-body integrity remains in Fetch. Errors retain the last confirmed publication report even if a later retry fails. A no-limit apply fences the root and collects unreachable objects without rebuilding an unchanged indexed range.
-Independent reviewer runtime: pending.
-Final review: pending.
-PR: https://github.com/smarzola/walstream/pull/5 (draft), opened after approved goal commit `dd057a4`.
-Goal status: revision 1 implemented and verified by the implementer; final independent review and ready-PR delivery remain.
+Independent reviewer runtime: passed on 2026-09-06 by fresh `gpt-5.6-sol` agent `retention_final_review`, with no inherited conversation. It reviewed exact implementation commit `28d1e27f7780581d28dc76a0dcc02fb02c0568e4` against `c0647b9`, built/launched the actual broker and maintenance CLI, and ran `./scripts/test-maintenance.sh --baseline-broker /tmp/walstream-retention-schema2` in its own RustFS container `walstream-maintenance-1788681345-77907`, prefix `walkthrough-1788681345-77907/clusters/maintenance`.
+
+The reviewer independently observed the same preview/apply storage change, offset-preserving repeated cycles and empty-log replacement, paused writer/reader/preparation recovery, pre-publication and partial-delete interruption, legacy age adoption with unchanged bytes, old-binary rejection, and corrupt-metadata rejection. It also reran all 16 focused maintenance tests and the binary test. The runtime output is in its task transcript (exec session `82337`, chunks `fc2783` and `a04eee`); focused checks are in session `68965`, chunks `e37d19` and `8b7554`. The reviewer confirmed cleanup and a clean unchanged source tree.
+Final review: no material blocking findings. The reviewer found the concurrency/fault tests distinct and useful, implementation complexity proportionate to the deletion safety contract, and documentation accurate. No repairs were requested.
+PR: https://github.com/smarzola/walstream/pull/5, **ready for review**. Opened draft after goal commit `dd057a4`; implementation committed and pushed as `28d1e27`. After independent review, both push/PR CI checks passed on the exact implementation head. Updated the description to the actual behavior and measured evidence, marked ready, and read back `isDraft: false`, both checks `SUCCESS`, and merge state `CLEAN`. This completion record changes only the goal; verify its final published checks before handoff. No merge or release was performed.
+Goal status: **Complete**. Revision 1 implementation, both runtime records, clean final review, and ready-PR delivery are verified. No unmet implementation criteria or material findings remain.
 
 On resume, reconcile this goal, actual approval and preference answers, applicable instructions, git state/history, and PR status. Continue unfinished work without weakening criteria. Completion requires the verified outcomes, both runtime records, a clean material review, and the ready-PR delivery state.
