@@ -4,33 +4,45 @@ Walstream maps each Kafka topic to schema-versioned metadata plus one independen
 
 ## Commit protocol
 
-Each partition has one schema-3 JSON manifest containing a monotonic publication revision, the earliest retained and next exclusive offsets, a legacy adoption time, at most 64 active segment descriptors, and an optional immutable index-tree reference. A segment descriptor fixes the object path, base offset, record count, encoded byte length, SHA-256 digest, and optional broker receive time.
+Each partition has one schema-4 JSON manifest containing a monotonic publication revision, the earliest retained and next exclusive offsets, a legacy adoption time, at most 64 active segment descriptors, and optional immutable offset-index and producer-directory references. A segment descriptor fixes the object path, base offset, record count, encoded byte length, SHA-256 digest, and optional broker receive time.
 
-Sealed index leaves contain exactly 64 ordered descriptors. Branches contain 1–64 child references with contiguous offset ranges, equal child levels, segment counts, lengths, and SHA-256 digests. Every subtree except the rightmost is full. Pages live under the partition's `index/<uuid>.json` namespace. When a full active tail rolls over, a writer creates its immutable leaf and replaces only the rightmost branch path, growing a new tree level when necessary. Ordinary appends update only the root; ListOffsets reads the root; Fetch seeks through offset ranges and stops when its response budget is exhausted. Reads take their snapshot from one root and its immutable descendants, without listing objects or consulting local recovery state.
+Sealed index leaves contain exactly 64 ordered descriptors. Branches contain 1–64 child references with contiguous offset ranges, equal child levels, segment counts, lengths, and SHA-256 digests. Every subtree except the rightmost is full. Pages live under the partition's `index/<uuid>.json` namespace. When a full active tail rolls over, a writer creates its immutable leaf and replaces only the rightmost branch path, growing a new tree level when necessary. Non-idempotent appends without rollover update only the root; ListOffsets reads the root; Fetch seeks through offset ranges and stops when its response budget is exhausted. Reads take their snapshot from one root and its immutable descendants, without listing objects or consulting local recovery state.
 
 New topics persist their creation-time partition count in `<prefix>/clusters/<cluster-id>/topics/<topic>/metadata.json`. The operator default is bounded to `1..=1024`, and a later setting change cannot reinterpret an existing topic. A valid legacy partition-0 manifest without metadata is inferred and upgraded as a one-partition topic without log rewrite. Partition manifests and segment namespaces are otherwise independent.
 
-For every append, a writer reads the manifest and its ETag, assigns the next contiguous offsets, canonicalizes the accepted records into one uncompressed Kafka v2 record batch, creates any required immutable index pages, and writes the UUID-named record object. It then either conditionally creates the first manifest or updates the existing manifest with `If-Match` semantics.
+For every append, a writer reads the manifest and its ETag, assigns the next contiguous offsets, validates every native batch, creates any required immutable offset/producer pages, and writes UUID-named record objects. Native producer batch boundaries remain intact. Ordinary non-idempotent requests retain the existing single-batch canonicalization. It then either conditionally creates the first manifest or updates the existing manifest with `If-Match` semantics.
 
 The manifest write is the only commit point. A precondition failure means another writer committed first; the losing segment is an invisible orphan and the writer retries from the new manifest. An acknowledged append therefore has a unique contiguous range, while failed or crashed attempts cannot become visible without a committed manifest reference.
+
+## Producer state
+
+`InitProducerId` with a null transactional ID allocates a fresh nonnegative ID at epoch zero from a cluster-wide conditional-update object. IDs are never reused; an ambiguous initialization response can consume an unused ID. Transactional initialization is rejected. Nontransactional clients can advance their epoch locally; epoch ordering does not wrap. An exhausted epoch requires a new producer ID.
+
+The partition root references an immutable B+tree keyed by producer ID. Leaves contain up to 64 strictly sorted states; branches contain 2–64 ordered, nonoverlapping references with equal child levels. References include ID bounds, count, level, byte length, and SHA-256. Levels 0–12 and strictly decreasing child levels bound traversal. Inserting or updating a producer rewrites its search path, splitting full pages. Each page body is bounded to 4 MiB and its arrays stop at 64 entries during deserialization.
+
+A state holds the current epoch and the latest five batch identities: base sequence, record count, original base offset, and SHA-256 of validated canonical records with normalized offsets and leader epoch. It retains producer identity, timestamps, keys, values, and headers. Matching epoch/sequence/count/content returns the original range. A lower epoch, gap, or conflicting retry fails. A higher epoch requires sequence zero and clears the old retry window. Sequence advancement wraps modulo 2^31; canonical record encoding preserves the codec's derived per-record signed wrap within a batch.
+
+All batches in a partition request are decided against one private snapshot before object writes. Only new batches advance the log. Their records and final producer states share one root CAS; losing that CAS discards the whole prepared update. Requests containing only recognized duplicates perform no writes. The protocol requires `acks=all` for idempotent records. A request may contain multiple native batches, but retries older than the retained five-batch window fail explicitly.
+
+Retention preserves the producer-directory reference even when it rebuilds or empties the offset index. Batch identities have no record-object references, so expired record objects remain collectible. Maintenance inventories the producer namespace before fencing and fully validates the directory after publication before deleting any candidate. Producer entries do not expire automatically: metadata and maintenance work grow with distinct producer IDs, and producer pages count against `--max-objects` just like other live objects. Raising that bound can accommodate a larger graph up to its documented hard limit.
 
 ## Crash cases
 
 | Failure point | Result |
 | --- | --- |
 | Before any object create | No durable change |
-| After record/index object create, before manifest CAS | Invisible orphan; never fetched |
+| After record/index/producer object create, before manifest CAS | Invisible orphan; never fetched |
 | Manifest CAS precondition failure | Invisible orphan; retry from current ETag |
-| After successful manifest CAS, before response | Data is committed; client may retry because the MVP has no idempotent producer support |
+| After successful manifest CAS, before response | Data and producer state are committed; a recognized idempotent retry receives its original offsets without another append |
 | After acknowledgement | A fresh process reconstructs the log from the bucket |
 
-Unreachable record and index objects remain invisible until an explicit maintenance pass collects them. Successful rollovers can leave superseded branch pages; failed attempts can leave tentative objects. Their age alone never authorizes deletion.
+Unreachable record, index, and producer-state objects remain invisible until an explicit maintenance pass collects them. Successful rollovers can leave superseded branch pages; failed attempts can leave tentative objects. Their age alone never authorizes deletion.
 
 ## Durable-format upgrade
 
-The reader accepts schema-1 flat manifests and schema-2/3 index roots. A schema-1 manifest retains its 10,000-descriptor/4 MiB read limits. The next successful append or maintenance apply publishes schema 3 with one CAS against the exact old root version. Existing record objects and offsets are unchanged. Schema-2 pages can remain reachable without rewriting them.
+The reader accepts schema-1 flat manifests and schema-2/3/4 index roots. A schema-1 manifest retains its 10,000-descriptor/4 MiB read limits. The next successful append or maintenance apply publishes schema 4 with one CAS against the exact old root version. Existing record objects and offsets are unchanged. Schema-2 pages can remain reachable without rewriting them.
 
-New batches carry broker receive time captured once before append retries. Descriptors without receive times use the root's persisted adoption time. Reads and previews do not upgrade the format. Older binaries reject schema 3; stop old processes before upgrading. Mixed-version operation and downgrade after conversion are unsupported. Topic metadata and durable consumer-offset objects retain their existing behavior.
+New batches carry broker receive time captured once before append retries. Descriptors without receive times use the root's persisted adoption time. Schema-3 adoption time is preserved when upgrading to schema 4. Reads and previews do not upgrade the format. Older binaries reject schema 4; stop old processes before upgrading. Mixed-version operation and downgrade after conversion are unsupported. Topic metadata and durable consumer-offset objects retain their existing behavior.
 
 ## Retention and collection
 
@@ -38,13 +50,13 @@ New batches carry broker receive time captured once before append retries. Descr
 
 An apply attempt follows this order:
 
-1. Finish a bounded inventory of recognized UUID record/index keys in the selected partition. Never add later keys to this attempt's deletion set.
+1. Finish a bounded inventory of recognized UUID record/index/producer-state keys in the selected partition. Never add later keys to this attempt's deletion set.
 2. Load the current root and traverse its complete graph, validating every page, record descriptor, and record-object length. Calculate retention and, if needed, build a new bounded-page index referencing retained records.
 3. Publish the complete retained root with a CAS against the loaded version. Increment the revision even for GC-only maintenance, so identical logical ranges cannot recreate an old ETag. Failed or ambiguous publication authorizes no deletion.
 4. Traverse the exact published root completely. Any validation failure stops deletion; a missing object from a superseded root restarts the attempt. Check graph membership before deleting each candidate from the closed inventory.
 5. Report successful deletions, including already absent candidates. Other deletion errors stop the pass and report the committed range and partial progress. A later pass completes remaining reclamation.
 
-Fresh immutable keys are conditionally created and never reused. After a failed CAS, writers and collectors discard tentative objects and create new ones for the next attempt. They may publish references only to objects reachable from their loaded root or objects created in that attempt. These rules prevent an older paused operation from publishing an object that maintenance selected for deletion. Listings may omit candidates safely: omissions delay collection. Unknown filenames and objects outside the selected data/index namespaces are never candidates.
+Fresh immutable keys are conditionally created and never reused. After a failed CAS, writers and collectors discard tentative objects and create new ones for the next attempt. They may publish references only to objects reachable from their loaded root or objects created in that attempt. These rules prevent an older paused operation from publishing an object that maintenance selected for deletion. Listings may omit candidates safely: omissions delay collection. Unknown filenames and objects outside the selected data/index/producer-state namespaces are never candidates.
 
 Readers, append preparation, and collectors retain their exact root version. If a referenced GET or HEAD returns NotFound, they reload the root: a changed version permits a full retry; an unchanged version is an integrity failure. Partial Fetch buffers are discarded on retry. Corruption and general transport errors are not treated as expiry. A read may finish from its original coherent snapshot if all required objects remain available, or retry and discover that its requested offset expired. No durable reader pins, grace period, or synchronized clocks are needed for GC safety.
 
@@ -64,7 +76,7 @@ A broker replacement therefore preserves every partition's next committed offset
 
 ## Read path and bounds
 
-Root and page bodies are streamed under a 4 MiB cap. Indexed tail and page collections stop at 64 entries, while the legacy schema-1 reader retains its 10,000-entry limit. Traversal accepts page levels 0–10 and requires each child level to decrease, bounding depth even for cyclic or forged references. Per-page namespace, range, count, length, checksum, and tree-shape checks precede use. Schema-2 revisions equal the segment count; schema-3 revisions count successful publications and may exceed the retained segment count.
+Root and page bodies are streamed under a 4 MiB cap. Indexed tail and page collections stop at 64 entries, while the legacy schema-1 reader retains its 10,000-entry limit. Traversal accepts page levels 0–10 and requires each child level to decrease, bounding depth even for cyclic or forged references. Per-page namespace, range, count, length, checksum, and tree-shape checks precede use. Schema-2 revisions equal the segment count; schema-3/4 revisions advance on publications and may exceed the retained segment count.
 
 Only pages on the requested read or update path are loaded and validated. This avoids a whole-history scan; it is not a full-log integrity audit. A missing accessed page is retried only when the loaded root has changed; corruption fails the operation. Fetch selects complete segments using descriptor lengths before downloading record objects, including across leaf/tail boundaries. Empty tail-of-log reads and ListOffsets need only the root's validated range.
 

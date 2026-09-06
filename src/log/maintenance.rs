@@ -118,7 +118,7 @@ impl std::fmt::Display for MaintenanceReport {
         if self.format_adoption {
             writeln!(
                 f,
-                "Format adoption: schema 3; existing batches receive a new age window"
+                "Format adoption: schema 4; stored age metadata is preserved"
             )?;
         }
         if !self.applied && !self.publication_uncertain {
@@ -257,8 +257,24 @@ impl LogEngine {
             // Retention rebuilds the small-page index; no record bytes change.
             // With no trimming, an indexed root reuses its live pages.
             let rebuild = expired != 0 || matches!(&loaded.manifest, LogManifest::Legacy(_));
+            let producers = match &loaded.manifest {
+                LogManifest::Indexed(root) => root.producers.clone(),
+                _ => None,
+            };
+            let producer_namespace =
+                format!("{}/topics/{topic}/{partition}/producer-state/", self.prefix);
             let planned_live: HashSet<String> = if rebuild {
-                retained.iter().map(|s| s.object.clone()).collect()
+                retained
+                    .iter()
+                    .map(|s| s.object.clone())
+                    .chain(
+                        graph
+                            .objects
+                            .iter()
+                            .filter(|key| key.starts_with(&producer_namespace))
+                            .cloned(),
+                    )
+                    .collect()
             } else {
                 graph.objects.clone()
             };
@@ -307,6 +323,7 @@ impl LogEngine {
                     _ => unreachable!(),
                 }
             };
+            root.producers = producers;
             root.schema = INDEX_SCHEMA;
             root.adopted_at_ms = Some(adoption);
             // Monotonic revision prevents identical-body/ETag ABA, even for an
@@ -388,7 +405,11 @@ impl LogEngine {
         let namespace = format!("{}/topics/{topic}/{partition}/", self.prefix);
         let mut objects = BTreeMap::new();
         let mut scanned = 0;
-        for (directory, suffix) in [("segments", ".batch"), ("index", ".json")] {
+        for (directory, suffix) in [
+            ("segments", ".batch"),
+            ("index", ".json"),
+            ("producer-state", ".json"),
+        ] {
             let prefix = format!("{namespace}{directory}/");
             let path = Path::from(prefix.clone());
             let mut listed = self.store.list(Some(&path));
@@ -427,6 +448,8 @@ impl LogEngine {
             LogManifest::Legacy(legacy) => graph.segments = legacy.segments.clone(),
             LogManifest::Indexed(root) => {
                 self.trace_index(topic, partition, root, &mut graph, maximum)
+                    .await?;
+                self.trace_producers(topic, partition, root, &mut graph, maximum)
                     .await?
             }
         }

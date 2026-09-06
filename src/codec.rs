@@ -12,6 +12,7 @@ pub(crate) const MAX_HEADERS_PER_REQUEST: usize = 32_768;
 pub(crate) struct BatchInspection {
     pub batch_count: usize,
     pub record_count: usize,
+    pub batch_record_counts: Vec<usize>,
     pub record_header_counts: Vec<usize>,
 }
 
@@ -47,6 +48,10 @@ pub(crate) fn inspect_record_batches(encoded: &Bytes) -> Result<BatchInspection,
     Ok(BatchInspection {
         batch_count: infos.len(),
         record_count,
+        batch_record_counts: infos
+            .iter()
+            .map(|info| info.record_count as usize)
+            .collect(),
         record_header_counts,
     })
 }
@@ -95,8 +100,17 @@ fn validate_raw_records(
         let batch_length = usize::try_from(batch_length).map_err(|_| CodecError::Malformed)?;
         let batch = take_raw(&mut batches, batch_length)?;
         let mut records = batch.get(49..).ok_or(CodecError::Malformed)?;
+        if info.producer_id >= 0
+            && i32::from_be_bytes(
+                batch[11..15]
+                    .try_into()
+                    .map_err(|_| CodecError::Malformed)?,
+            ) != info.record_count - 1
+        {
+            return Err(CodecError::Malformed);
+        }
 
-        for _ in 0..info.record_count {
+        for ordinal in 0..info.record_count {
             let record_length = read_var_i32(&mut records)?;
             let record_length =
                 usize::try_from(record_length).map_err(|_| CodecError::Malformed)?;
@@ -111,7 +125,9 @@ fn validate_raw_records(
                 .checked_add(timestamp_delta)
                 .ok_or(CodecError::ArithmeticOverflow)?;
             let offset_delta = read_var_i32(&mut record)?;
-            if offset_delta < 0 {
+            if offset_delta < 0
+                || (info.producer_id >= 0 && (info.base_sequence < 0 || offset_delta != ordinal))
+            {
                 return Err(CodecError::Malformed);
             }
             info.min_offset

@@ -30,6 +30,7 @@ pub(crate) fn validate_request_frame(
     match api_key {
         ApiKey::ApiVersions => validate_api_versions(&mut cursor, version)?,
         ApiKey::Metadata => validate_metadata(&mut cursor)?,
+        ApiKey::InitProducerId => validate_init_producer_id(&mut cursor, version)?,
         ApiKey::Produce => validate_produce(&mut cursor)?,
         ApiKey::Fetch => validate_fetch(&mut cursor)?,
         ApiKey::ListOffsets => validate_list_offsets(&mut cursor)?,
@@ -52,6 +53,25 @@ fn validate_api_versions(cursor: &mut Cursor<'_>, version: i16) -> Result<(), Wi
     if version >= 3 {
         cursor.compact_string()?;
         cursor.compact_string()?;
+        cursor.tagged_fields()?;
+    }
+    Ok(())
+}
+
+fn validate_init_producer_id(cursor: &mut Cursor<'_>, version: i16) -> Result<(), WireError> {
+    if version >= 2 {
+        let length = cursor.unsigned_varint()?;
+        if length > 0 {
+            cursor.take((length - 1) as usize)?;
+        }
+    } else {
+        cursor.classic_string(true)?;
+    }
+    cursor.take(4)?; // transaction timeout
+    if version >= 3 {
+        cursor.take(10)?;
+    } // expected producer id/epoch
+    if version >= 2 {
         cursor.tagged_fields()?;
     }
     Ok(())
