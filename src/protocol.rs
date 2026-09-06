@@ -901,7 +901,10 @@ fn log_error_code(error: &LogError) -> i16 {
         | LogError::MissingSegment { .. }
         | LogError::CorruptSegment { .. }
         | LogError::Codec { .. } => ResponseError::CorruptMessage.code(),
-        LogError::OffsetOverflow
+        LogError::InvalidMaintenance { .. }
+        | LogError::MaintenanceBudget { .. }
+        | LogError::MaintenanceIncomplete { .. }
+        | LogError::OffsetOverflow
         | LogError::RevisionOverflow
         | LogError::ManifestTooLarge { .. }
         | LogError::Serialization(_)

@@ -6,7 +6,7 @@ use super::*;
 #[cfg(test)]
 mod tests;
 
-pub(super) const INDEX_SCHEMA: u32 = 2;
+pub(super) const INDEX_SCHEMA: u32 = 3;
 pub(super) const PAGE_ENTRIES: usize = 64;
 // 64^(10+1) exceeds the positive i64 offset space. A strict decreasing level
 // bounds traversal even if durable references are maliciously cyclic.
@@ -17,6 +17,10 @@ const MAX_LEVEL: u8 = 10;
 pub(super) struct Root {
     pub schema: u32,
     pub revision: u64,
+    #[serde(default)]
+    pub start_offset: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_at_ms: Option<u64>,
     pub next_offset: i64,
     pub tree: Option<PageRef>,
     #[serde(deserialize_with = "entries")]
@@ -28,6 +32,8 @@ impl Default for Root {
         Self {
             schema: INDEX_SCHEMA,
             revision: 0,
+            start_offset: 0,
+            adopted_at_ms: Some(0),
             next_offset: 0,
             tree: None,
             tail: Vec::new(),
@@ -68,7 +74,7 @@ where
     deserialize_bounded::<D, T, PAGE_ENTRIES>(deserializer)
 }
 
-fn invalid(detail: impl Into<String>) -> LogError {
+pub(super) fn invalid(detail: impl Into<String>) -> LogError {
     LogError::InvalidManifest {
         detail: detail.into(),
     }
@@ -110,21 +116,37 @@ impl PageRef {
 
 impl Root {
     pub fn validate(&self, prefix: &str, topic: &str, partition: i32) -> Result<(), LogError> {
-        if self.schema != INDEX_SCHEMA || self.tail.len() > PAGE_ENTRIES {
+        if !matches!(self.schema, 2 | INDEX_SCHEMA)
+            || self.tail.len() > PAGE_ENTRIES
+            || self.start_offset < 0
+            || self.next_offset < self.start_offset
+            || (self.schema == INDEX_SCHEMA && self.adopted_at_ms.is_none())
+            || (self.schema == 2
+                && (self.start_offset != 0
+                    || self.adopted_at_ms.is_some()
+                    || self
+                        .tail
+                        .iter()
+                        .any(|segment| segment.received_at_ms.is_some())))
+        {
             return Err(invalid("unsupported or oversized index root"));
         }
         let (start, count) = if let Some(tree) = &self.tree {
             tree.validate(prefix, topic, partition)?;
-            if tree.first_offset != 0 {
-                return Err(invalid("index must start at offset zero"));
+            if tree.first_offset != self.start_offset {
+                return Err(invalid("index must start at the retained offset"));
             }
             (tree.next_offset, tree.segment_count)
         } else {
-            (0, 0)
+            (self.start_offset, 0)
         };
         let next = validate_segments(&self.tail, start, prefix, topic, partition)?;
         if next != self.next_offset
-            || count.checked_add(self.tail.len() as u64) != Some(self.revision)
+            || count
+                .checked_add(self.tail.len() as u64)
+                .is_none_or(|count| {
+                    count > self.revision || (self.schema == 2 && count != self.revision)
+                })
             || (self.tail.is_empty() && self.tree.is_some())
         {
             return Err(invalid("index root range or revision is inconsistent"));
@@ -322,8 +344,12 @@ impl LogEngine {
         topic: &str,
         partition: i32,
         legacy: Manifest,
+        now_ms: u64,
     ) -> Result<Root, LogError> {
-        let mut root = Root::default();
+        let mut root = Root {
+            adopted_at_ms: Some(now_ms),
+            ..Root::default()
+        };
         for segment in legacy.segments {
             if root.tail.len() == PAGE_ENTRIES {
                 self.seal_tail(topic, partition, &mut root).await?;
@@ -333,6 +359,97 @@ impl LogEngine {
         root.revision = legacy.revision;
         root.next_offset = legacy.next_offset;
         Ok(root)
+    }
+
+    pub(super) async fn rebuild_index(
+        &self,
+        topic: &str,
+        partition: i32,
+        segments: &[Segment],
+        start_offset: i64,
+        next_offset: i64,
+        maximum: usize,
+    ) -> Result<Root, LogError> {
+        let sealed = segments.len().saturating_sub(1) / PAGE_ENTRIES * PAGE_ENTRIES;
+        let mut count = segments.len();
+        let mut level_count = sealed / PAGE_ENTRIES;
+        while level_count != 0 {
+            count = count
+                .checked_add(level_count)
+                .ok_or(LogError::MaintenanceBudget { maximum })?;
+            level_count = if level_count == 1 {
+                0
+            } else {
+                level_count.div_ceil(PAGE_ENTRIES)
+            };
+        }
+        if count > maximum {
+            return Err(LogError::MaintenanceBudget { maximum });
+        }
+        let mut pages = Vec::new();
+        for chunk in segments[..sealed].chunks(PAGE_ENTRIES) {
+            pages.push(
+                self.write_page(
+                    topic,
+                    partition,
+                    Page::Leaf {
+                        segments: chunk.to_vec(),
+                    },
+                )
+                .await?,
+            );
+        }
+        while pages.len() > 1 {
+            let mut parents = Vec::new();
+            for children in pages.chunks(PAGE_ENTRIES) {
+                parents.push(
+                    self.write_page(
+                        topic,
+                        partition,
+                        Page::Branch {
+                            children: children.to_vec(),
+                        },
+                    )
+                    .await?,
+                );
+            }
+            pages = parents;
+        }
+        Ok(Root {
+            start_offset,
+            next_offset,
+            tree: pages.pop(),
+            tail: segments[sealed..].to_vec(),
+            ..Root::default()
+        })
+    }
+
+    pub(super) async fn trace_index(
+        &self,
+        topic: &str,
+        partition: i32,
+        root: &Root,
+        graph: &mut maintenance::LiveGraph,
+        maximum: usize,
+    ) -> Result<(), LogError> {
+        let mut stack: Vec<PageRef> = root.tree.clone().into_iter().collect();
+        while let Some(reference) = stack.pop() {
+            graph.insert(&reference.object, maximum)?;
+            match self.read_page(topic, partition, &reference).await? {
+                Page::Leaf { segments } => {
+                    if graph.segments.len() + segments.len() > maximum {
+                        return Err(LogError::MaintenanceBudget { maximum });
+                    }
+                    graph.segments.extend(segments);
+                }
+                Page::Branch { children } => stack.extend(children.into_iter().rev()),
+            }
+        }
+        if graph.segments.len() + root.tail.len() > maximum {
+            return Err(LogError::MaintenanceBudget { maximum });
+        }
+        graph.segments.extend(root.tail.clone());
+        Ok(())
     }
 
     pub(super) async fn indexed_segments(

@@ -4,7 +4,7 @@ Repository: `/Users/smarzola/projects/walstream`
 Source of truth: this contract and the request to pursue the next milestone after PR #4.
 Revision: 1, prepared 2026-09-06.
 Approval: **Approved** revision 1 on 2026-09-06. The user replied “Approved” to the concrete retention and garbage collection plan and its defaults.
-Execution: approved; implementation in progress.
+Execution: implementation and implementer verification complete; independent final review and PR readiness pending.
 Goal-file commit policy: **Commit after approval.** `git ls-files docs/goals` and merged history show two comparable committed goal contracts, including `scalable-partition-log-metadata.md` in PR #4.
 PR delivery: GitHub `smarzola/walstream`, base `main`, proposed branch `feat/retention-garbage-collection`. Open a draft after approval and keep it draft through implementation and independent review; finish with a verified ready PR.
 
@@ -98,8 +98,8 @@ Final review: one new independent Sol reviewer (`gpt-5.6-sol`) with no inherited
 
 Starting branch/base: `main` at `c0647b9748b8b1d641aab7b9026f242cf4d01ad3`.
 
-- [ ] Retained-range metadata, age semantics, migration, and stale-snapshot retry behavior verified.
-- [ ] Preview/apply maintenance and deletion/failure invariants verified, including measured storage cleanup.
+- [x] Retained-range metadata, age semantics, migration, and stale-snapshot retry behavior verified.
+- [x] Preview/apply maintenance and deletion/failure invariants verified, including measured storage cleanup.
 - [ ] Full runtime/regression evidence, independent final review, and ready PR completed.
 
 Commit and push coherent verified milestones, recording concise evidence and material choices. Reuse valid evidence until a code/input/environment change or finding invalidates it; do not rerun passing checks merely at a checkpoint boundary.
@@ -132,10 +132,24 @@ Each role independently builds with `cargo build --release`, starts the real bro
 | Failure and resume | Interrupt maintenance before root publication and during deletion; repeat it | No pre-publication deletion; durable range remains valid; rerun completes partial reclamation |
 | Legacy data and corruption | Adopt schema-1/2 fixtures; test clock behavior and old-binary rejection; corrupt a separate live graph | Legacy bytes stay unchanged, age adoption is conservative, old binaries fail closed, and corrupt live metadata prevents deletion |
 
-Implementer runtime: pending.
+Implementer runtime: passed on 2026-09-06, macOS arm64 with Apple Container and disposable RustFS 1.0.0-beta.12. `./scripts/test-maintenance.sh --baseline-broker /tmp/walstream-retention-schema2` built the release binary and exercised Kafka plus the actual maintenance CLI. The baseline executable was built from `c0647b9` before source edits.
+
+- Preview preserved every listed key and ETag. A 260-append workload with a 12,000-byte record limit retained offsets `[107, 260)` and 11,934 record bytes. Visible storage changed from 269 objects / 98,631 bytes to 158 objects / 57,371 bytes. Counts include topic/root/index objects; sizes are visible object bytes on this workload, not version purging or a throughput measurement.
+- Repeated append/maintain/read cycles crossed page boundaries. Real proxy barriers paused a writer before root publication, a reader before an old index GET, and a writer during rollover preparation. Collected tentative objects did not become visible; stale operations retried or reported expiry.
+- Empty-log replacement retained next offset 391. Killing maintenance before its root PUT left the log unchanged; killing it after exactly three deletes left the range committed, and rerunning collected the remaining 78 objects.
+- Schema-1/2 fixtures retained their original record bytes and received a fresh age window. A real schema-2 binary rejected upgraded partitions. Corrupt live index metadata produced a nonzero CLI result without publication or deletion.
+- Raw final walkthrough: `/tmp/walstream-maintenance-runtime-final.log`. The initial walkthrough is `/tmp/walstream-maintenance-runtime.log`. An error-reporting repair was followed by focused tests and the final walkthrough above.
+
+Automated verification: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, shell syntax checks, and `cargo test --all-targets` passed. The final test run contains 85 library tests, one binary test, three protocol tests, and two stock-client tests; the S3 test is intentionally ignored in that suite and passed separately on every backend. The first sandboxed integration attempt could not bind sockets; the complete run with local networking passed. Evidence: `/tmp/walstream-retention-full-final.log` and `/tmp/walstream-retention-unit.log` (16 focused maintenance tests).
+
+The 25,000-append regression passed, including complete replacement readback, unchanged legacy record objects, old-binary rejection, an intercepted pre-publication crash, and corrupt-page rejection. Its root was 11,825 bytes, with a 2,038-byte level-2 root index page. Evidence: `/tmp/walstream-retention-index-full.log`.
+
+RustFS, SeaweedFS, and MinIO each passed conditional writes, independent writers, index rollover/recovery, preview/apply retention, complete expiry, and append after empty-log replacement. Evidence: `/tmp/walstream-retention-s3-{rustfs,seaweedfs,minio}.log`. Pinned librdkafka 2.12.1 and Apache Kafka Java 4.2.0 passed retained-survivor recovery across broker replacement: `/tmp/walstream-retention-client-recovery.log`.
+
+Implementation decisions: schema 3 uses a monotonically increasing publication revision, separate retained start, optional per-batch receive times, and a persisted adoption time. Maintenance builds replacement index pages from the retained descriptors without rewriting records. Defaults are 100,000 objects per inventory/live graph, hard maximum 1,000,000, and 128 attempts. It validates complete index metadata and record existence/length; record-body integrity remains in Fetch. Errors retain the last confirmed publication report even if a later retry fails. A no-limit apply fences the root and collects unreachable objects without rebuilding an unchanged indexed range.
 Independent reviewer runtime: pending.
 Final review: pending.
-PR: not created; draft creation follows approval.
-Goal status: revision 1 approved; implementation in progress.
+PR: https://github.com/smarzola/walstream/pull/5 (draft), opened after approved goal commit `dd057a4`.
+Goal status: revision 1 implemented and verified by the implementer; final independent review and ready-PR delivery remain.
 
 On resume, reconcile this goal, actual approval and preference answers, applicable instructions, git state/history, and PR status. Continue unfinished work without weakening criteria. Completion requires the verified outcomes, both runtime records, a clean material review, and the ready-PR delivery state.

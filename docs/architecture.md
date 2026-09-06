@@ -4,7 +4,7 @@ Walstream maps each Kafka topic to schema-versioned metadata plus one independen
 
 ## Commit protocol
 
-Each partition has one schema-2 JSON manifest containing a revision (the committed segment count), the next exclusive offset, at most 64 active segment descriptors, and an optional immutable index-tree reference. A segment descriptor fixes the object path, base offset, record count, encoded byte length, and SHA-256 digest.
+Each partition has one schema-3 JSON manifest containing a monotonic publication revision, the earliest retained and next exclusive offsets, a legacy adoption time, at most 64 active segment descriptors, and an optional immutable index-tree reference. A segment descriptor fixes the object path, base offset, record count, encoded byte length, SHA-256 digest, and optional broker receive time.
 
 Sealed index leaves contain exactly 64 ordered descriptors. Branches contain 1–64 child references with contiguous offset ranges, equal child levels, segment counts, lengths, and SHA-256 digests. Every subtree except the rightmost is full. Pages live under the partition's `index/<uuid>.json` namespace. When a full active tail rolls over, a writer creates its immutable leaf and replaces only the rightmost branch path, growing a new tree level when necessary. Ordinary appends update only the root; ListOffsets reads the root; Fetch seeks through offset ranges and stops when its response budget is exhausted. Reads take their snapshot from one root and its immutable descendants, without listing objects or consulting local recovery state.
 
@@ -24,13 +24,33 @@ The manifest write is the only commit point. A precondition failure means anothe
 | After successful manifest CAS, before response | Data is committed; client may retry because the MVP has no idempotent producer support |
 | After acknowledgement | A fresh process reconstructs the log from the bucket |
 
-Walstream does not yet collect orphan segments, unpublished index pages, or superseded immutable branch pages. They cost storage but cannot change the readable log. Successful rollovers and migrations can also leave superseded pages. No deletion or retention policy is implemented.
+Unreachable record and index objects remain invisible until an explicit maintenance pass collects them. Successful rollovers can leave superseded branch pages; failed attempts can leave tentative objects. Their age alone never authorizes deletion.
 
 ## Durable-format upgrade
 
-The reader accepts schema-1 flat manifests and schema-2 index roots. A schema-1 manifest is fully bounded and validated with the existing 10,000-descriptor/4 MiB read limits. On its next append, the writer builds an index referencing the original record objects, adds the new batch, and publishes schema 2 with one CAS against the exact schema-1 ETag. Losing that race reloads current state and retries, including when another writer completed the migration. A crash before publication leaves the legacy manifest authoritative; a successful publication makes the complete indexed history recoverable.
+The reader accepts schema-1 flat manifests and schema-2/3 index roots. A schema-1 manifest retains its 10,000-descriptor/4 MiB read limits. The next successful append or maintenance apply publishes schema 3 with one CAS against the exact old root version. Existing record objects and offsets are unchanged. Schema-2 pages can remain reachable without rewriting them.
 
-Reads do not convert partition manifests, and original record objects and offsets are unchanged. Older binaries reject schema 2. Operators must stop old processes before adopting the new writer; mixed-version operation and downgrade after conversion are unsupported. Legacy topic-metadata inference and durable consumer-offset objects keep their existing behavior.
+New batches carry broker receive time captured once before append retries. Descriptors without receive times use the root's persisted adoption time. Reads and previews do not upgrade the format. Older binaries reject schema 3; stop old processes before upgrading. Mixed-version operation and downgrade after conversion are unsupported. Topic metadata and durable consumer-offset objects retain their existing behavior.
+
+## Retention and collection
+
+`maintain` previews one topic/partition. `--apply` permits writes and deletions; optional age and encoded-record-byte limits remove an oldest prefix of complete batches. The retained start never decreases and the next offset never changes during maintenance, including when all records expire. Future appends continue at that next offset. Consumer offsets do not pin data.
+
+An apply attempt follows this order:
+
+1. Finish a bounded inventory of recognized UUID record/index keys in the selected partition. Never add later keys to this attempt's deletion set.
+2. Load the current root and traverse its complete graph, validating every page, record descriptor, and record-object length. Calculate retention and, if needed, build a new bounded-page index referencing retained records.
+3. Publish the complete retained root with a CAS against the loaded version. Increment the revision even for GC-only maintenance, so identical logical ranges cannot recreate an old ETag. Failed or ambiguous publication authorizes no deletion.
+4. Traverse the exact published root completely. Any validation failure stops deletion; a missing object from a superseded root restarts the attempt. Check graph membership before deleting each candidate from the closed inventory.
+5. Report successful deletions, including already absent candidates. Other deletion errors stop the pass and report the committed range and partial progress. A later pass completes remaining reclamation.
+
+Fresh immutable keys are conditionally created and never reused. After a failed CAS, writers and collectors discard tentative objects and create new ones for the next attempt. They may publish references only to objects reachable from their loaded root or objects created in that attempt. These rules prevent an older paused operation from publishing an object that maintenance selected for deletion. Listings may omit candidates safely: omissions delay collection. Unknown filenames and objects outside the selected data/index namespaces are never candidates.
+
+Readers, append preparation, and collectors retain their exact root version. If a referenced GET or HEAD returns NotFound, they reload the root: a changed version permits a full retry; an unchanged version is an integrity failure. Partial Fetch buffers are discarded on retry. Corruption and general transport errors are not treated as expiry. A read may finish from its original coherent snapshot if all required objects remain available, or retry and discover that its requested offset expired. No durable reader pins, grace period, or synchronized clocks are needed for GC safety.
+
+Inventory and graph limits default to 100,000 objects and have a hard maximum of 1,000,000. Each operation permits at most 128 attempts. Inventory/planning budget exhaustion stops before publication; post-publication validation errors stop deletion and report committed state. Maintenance may rebuild the retained index, while ordinary append and Fetch retain bounded path access without listings. Record bodies are not rewritten or downloaded by maintenance; full content integrity checks remain in Fetch.
+
+A crash before publication leaves only tentative objects. A crash after publication leaves retention effective, with some or all eligible objects still present. Retrying is safe. Ordinary deletion removes visible keys; purging historical versions in versioned buckets is outside this feature.
 
 ## Consumer-group state
 
@@ -44,9 +64,9 @@ A broker replacement therefore preserves every partition's next committed offset
 
 ## Read path and bounds
 
-Root and page bodies are streamed under a 4 MiB cap. Schema-2 tail and page collections stop at 64 entries, while the legacy schema-1 reader retains its 10,000-entry limit. Traversal accepts page levels 0–10 and requires each child level to decrease, bounding depth even for cyclic or forged references. Per-page namespace, range, count, length, checksum, and tree-shape checks precede use. Root revisions agree with the indexed segment count plus the active tail.
+Root and page bodies are streamed under a 4 MiB cap. Indexed tail and page collections stop at 64 entries, while the legacy schema-1 reader retains its 10,000-entry limit. Traversal accepts page levels 0–10 and requires each child level to decrease, bounding depth even for cyclic or forged references. Per-page namespace, range, count, length, checksum, and tree-shape checks precede use. Schema-2 revisions equal the segment count; schema-3 revisions count successful publications and may exceed the retained segment count.
 
-Only pages on the requested read or update path are loaded and validated. This avoids a whole-history scan; it is not a full-log integrity audit. A missing or corrupt accessed page fails the operation. Fetch selects complete segments using descriptor lengths before downloading record objects, including across leaf/tail boundaries. Empty tail-of-log reads and ListOffsets need only the root's validated range.
+Only pages on the requested read or update path are loaded and validated. This avoids a whole-history scan; it is not a full-log integrity audit. A missing accessed page is retried only when the loaded root has changed; corruption fails the operation. Fetch selects complete segments using descriptor lengths before downloading record objects, including across leaf/tail boundaries. Empty tail-of-log reads and ListOffsets need only the root's validated range.
 
 Every selected segment's object metadata must match its bounded manifest length, and its body is streamed only up to that length before its SHA-256 is checked. Its Kafka CRC and raw record boundaries are checked before the upstream decoder may allocate. Record/header counts, reserved attributes, and delta arithmetic are validated, duplicate header keys are rejected, decoded offsets and unsupported semantics are checked, and safe deterministic re-encoding must reproduce the original bytes exactly.
 
